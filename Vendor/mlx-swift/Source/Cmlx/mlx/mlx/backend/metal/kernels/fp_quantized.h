@@ -1,4 +1,3 @@
-// Copyright © 2025 Apple Inc.
 
 #include <metal_simdgroup>
 #include <metal_stdlib>
@@ -30,7 +29,6 @@ inline constexpr short get_bytes_per_pack() {
 template <typename T, int group_size>
 static inline T dequantize_scale(uint8_t s) {
   if constexpr (group_size == 16) {
-    // Use nv scale
     return T(*(thread fp8_e4m3*)(&s));
   } else {
     return T(*(thread fp8_e8m0*)(&s));
@@ -81,26 +79,6 @@ inline void load_vector_safe(const device T* x, thread U* x_thread, int N) {
 template <typename U, int values_per_thread, int bits>
 inline U qdot(const device uint8_t* w, const thread U* x_thread, U scale) {
   if constexpr (bits == 4 && values_per_thread == 16) {
-    // Specialized fp4 decode for the qmv_fast family (values_per_thread ==
-    // 16, e.g. nvfp4 gs=16 decode). Each 4-bit code n decodes through the
-    // same half bit pattern (magnitude (n & 7) << 9 with sign (n & 8) in
-    // the half sign bit) and the same exact half -> float conversion as the
-    // generic bits == 4 path below. Two further bit-exact ALU eliminations
-    // are applied on top of the split-nibble decode (see the JIT twin
-    // mlx-generated/fp_quantized.cpp for the full argument):
-    //
-    // (a) 2^14 renormalization fold: power-of-two scaling is exact at every
-    //     step, so moving the 2^14 from the eight decoded float2s onto the
-    //     one scale multiply -- (scale * 16384.0f) * accum -- leaves every
-    //     partial sum exactly 2^-14 times its old value and the single
-    //     final rounding lands on the identical result (the e4m3 scale
-    //     cannot overflow: |s| <= 448, so scale * 16384.0f <= 7.3e6).
-    //
-    // (b) Dead +0.0f accumulator-seed elision: +0.0f + t == t bitwise
-    //     except t == -0.0f, and that case leaves only a sign-of-zero
-    //     difference that every caller's +0.0f-seeded result cell absorbs
-    //     (+0.0f + -0.0f == +0.0f). The two packed-word bodies are emitted
-    //     textually, as the compiler was already fully unrolling them.
     const device uint2* wq = (const device uint2*)w;
     const uint2 codes = wq[0];
     U accum;
@@ -221,64 +199,7 @@ inline void dequantize(uint8_t w, U scale, threadgroup U* w_local) {
   }
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// NVFP4 block-loader staging fast path.
-//
-// Two bit-exact rewrites of the fp4 staging chain QuantizedBlockLoader runs
-// (the qmm / gather-qmm prefill kernels). Both rest on one observation about
-// `fp4_e2m1::operator float16_t()`:
-//
-//     half converted = as_type<half>(ushort((bits & 7) << 9));
-//     converted *= 16384.0;                        // 2^14
-//     return bits & 8 ? -converted : converted;
-//
-// The 3-bit magnitude field is *bit-embedded* into a half -- fp4's 2-bit
-// exponent lands in the low two bits of half's 5-bit exponent field and fp4's
-// single mantissa bit lands in half mantissa bit 9 -- so the reinterpreted
-// half is already the right number up to a fixed power of two: exactly
-// {0, .5, 1, 1.5, 2, 3, 4, 6} * 2^-14. The `* 16384.0` is a pure
-// renormalization, never a rounding step. (0.5 * 2^-14 == 2^-15 is a half
-// subnormal, and its bit pattern is precisely the one we started from, so
-// nothing rounds there either.)
-//
-// CHANGE 1 -- hoist the 2^14 out of the per-value converts into the one
-// per-group scale. The loader stores `scale * value`, so with
-//     s = the e4m3 group scale (at most 4 significant bits, |s| in
-//         [2^-9, 448] or NaN)
-//     m = an fp4 magnitude in {0, .5, 1, 1.5, 2, 3, 4, 6}
-// today's chain rounds `s * (m * 2^-14 * 2^14)` once and the folded chain
-// rounds `(s * 2^14) * (m * 2^-14)` once. Every factor is exact in binary FP:
-//   * s * 2^14 only shifts an exponent -- no rounding -- and can neither
-//     overflow (448 * 2^14 = 7340032, far inside float) nor underflow
-//     (2^-9 * 2^14 = 2^5),
-//   * m * 2^-14 is exactly representable in half, bfloat and float,
-//   * so both orderings are the SAME real number rounded once to the same
-//     destination type: identical bits.
-// The per-value multiply count drops from `n_reads * pack_factor` to one.
-// This is the loader-side sibling of the 2^22 fold `laguna_nvfp4_scale`
-// already carries in the decode custom kernels.
-//
-// Restricted to group_size == 16, the e4m3 (NVFP4) scale. mxfp4's e8m0 scales
-// (group_size 32) reach 2^127, where s * 2^14 would overflow to inf, so those
-// instantiations keep the original chain byte for byte.
-//
-// CHANGE 2 -- spread eight nibbles per uint32 instead of two per byte. The
-// byte-at-a-time chain costs AND + SHL + half multiply + AND + compare +
-// select per nibble plus a SHR per byte (~104 scalar ops per thread per
-// k-iteration at 16 values). The uint-at-a-time spread is four masked-
-// shift-OR groups, 19 integer ops per uint32, each producing a half2 whose
-// two lanes are two nibbles with the sign folded into the same OR. Ported
-// from `laguna_nvfp4_qdot_16` in the decode custom kernels. The half bit
-// patterns it builds are exactly the ones fp4_e2m1 builds one lane at a time,
-// so the staged values are unchanged.
-//
-// Verified by exhaustive GPU enumeration against the byte-at-a-time chain for
-// bfloat16_t, float16_t and float: all 256 scale bytes x all 256 packed
-// bytes, and all 256 scale bytes x all 65536 four-nibble codes -- 0 bit
-// mismatches out of 404,226,048 staged values.
-///////////////////////////////////////////////////////////////////////////////
 
-// Per-group NVFP4 scale with fp4's 2^14 renormalization folded in (Change 1).
 static inline float fp4nv_scale_x16384(uint8_t s) {
   if (s < 16u) {
     return float(uint(s) << 5);
@@ -286,9 +207,6 @@ static inline float fp4nv_scale_x16384(uint8_t s) {
   return float(*(thread fp8_e4m3*)(&s)) * 16384.0f;
 }
 
-// Four packed bytes -> one uint32 in little-endian nibble order. Read through
-// packed_uchar4, whose alignment is 1, so widening the access adds no address
-// precondition the byte-at-a-time loop did not already satisfy.
 static inline uint32_t fp4nv_pack4(const device uint8_t* p) {
   return as_type<uint32_t>(uchar4(*(const device packed_uchar4*)p));
 }
@@ -296,15 +214,8 @@ static inline uint32_t fp4nv_pack4(const thread uint8_t* p) {
   return as_type<uint32_t>(uchar4(p[0], p[1], p[2], p[3]));
 }
 
-// Decode the eight fp4 nibbles packed in `c` and apply the folded scale
-// (Change 2). `out[k]` is nibble k -- byte k/2's low half for even k, high
-// half for odd k -- which is exactly the order `dequantize<U, 4>` produces
-// when walking those four bytes.
 template <typename T>
 static inline void fp4nv_decode8(uint32_t c, float scale, thread T* out) {
-  // Split-nibble decode: identical half bit patterns to stock with fewer
-  // integer ops and fewer live constant registers. See qdot() for the
-  // bit-exactness argument.
   const uint32_t xe = c & 0x0F0F0F0Fu;
   const uint32_t ge = xe | (xe << 3);
   const uint32_t yo = c & 0xF0F0F0F0u;
@@ -326,6 +237,76 @@ static inline void fp4nv_decode8(uint32_t c, float scale, thread T* out) {
   out[7] = T(v3.y);
 }
 
+template <short role>
+METAL_FUNC int laguna_co_original_row(int row) {
+  if constexpr (role == 3) {
+    return (row >> 6) * 32 + (row & 31);
+  } else if constexpr (role == 7) {
+    return row & 511;
+  } else {
+    return row;
+  }
+}
+
+template <short role>
+METAL_FUNC int laguna_co_plane(int row) {
+  if constexpr (role == 2 || role == 6) {
+    return 1;
+  } else if constexpr (role == 3) {
+    return (row & 63) >= 32;
+  } else if constexpr (role == 7) {
+    return row >= 512;
+  } else {
+    return 0;
+  }
+}
+
+template <short role>
+METAL_FUNC const device uint8_t* laguna_co_code(
+    const device uint8_t* base,
+    int expert,
+    int row,
+    int k_byte) {
+  const int logical_row = laguna_co_original_row<role>(row);
+  if constexpr (role == 4 || role == 8) {
+    const size_t record = role == 4
+        ? size_t(expert) * 2048 + logical_row
+        : size_t(logical_row);
+    return base + 128 + record * 272 + k_byte;
+  } else {
+    const int block = k_byte >> 8;
+    const size_t record = (role <= 3 ? size_t(expert) * 512 : 0)
+        + logical_row;
+    return base + 128 + (record * 4 + block) * 544
+        + laguna_co_plane<role>(row) * 272 + (k_byte & 255);
+  }
+}
+
+template <short role>
+METAL_FUNC uint8_t laguna_co_scale(
+    const device uint8_t* base,
+    int expert,
+    int row,
+    int group) {
+  const int logical_row = laguna_co_original_row<role>(row);
+  const int plane = laguna_co_plane<role>(row);
+  if (expert == 0 && logical_row == 0 && group == 1) {
+    return base[plane];
+  }
+  if constexpr (role == 4 || role == 8) {
+    const size_t record = role == 4
+        ? size_t(expert) * 2048 + logical_row
+        : size_t(logical_row);
+    return base[128 + record * 272 + 256 + (group >> 1)];
+  } else {
+    const int block = group >> 5;
+    const size_t record = (role <= 3 ? size_t(expert) * 512 : 0)
+        + logical_row;
+    return base[128 + (record * 4 + block) * 544
+        + plane * 272 + 256 + ((group & 31) >> 1)];
+  }
+}
+
 template <
     typename T,
     short BROWS,
@@ -334,7 +315,8 @@ template <
     short reduction_dim,
     short tgp_size,
     short group_size,
-    short bits>
+    short bits,
+    short colayout_role = 0>
 struct QuantizedBlockLoader {
   MLX_MTL_CONST short pack_factor = get_pack_factor<8, bits>();
   MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack();
@@ -360,6 +342,10 @@ struct QuantizedBlockLoader {
   threadgroup T* dst;
   const device uint8_t* src;
   const device uint8_t* scales;
+  const device uint8_t* colayout_base;
+  int colayout_expert;
+  int colayout_row;
+  int colayout_k_byte;
 
   QuantizedBlockLoader(
       const device uint8_t* src_,
@@ -382,21 +368,44 @@ struct QuantizedBlockLoader {
             bj * bytes_per_pack),
         scales(
             scales_ + bi * src_ld / group_size +
-            (bj * pack_factor) / group_size) {}
+            (bj * pack_factor) / group_size),
+        colayout_base(src_),
+        colayout_expert(0),
+        colayout_row(0),
+        colayout_k_byte(bj * bytes_per_pack) {
+    static_assert(
+        colayout_role == 0 || reduction_dim == 1,
+        "Laguna co-layout only supports transposed weight staging");
+  }
 
-  // The NVFP4 staging fast path applies when the packing is one byte per two
-  // values, the scale is e4m3, and this thread's run of source bytes splits
-  // evenly into uint32s. Every fp4 instantiation in this file qualifies
-  // (n_reads is 4 for qmm_t/qmm_n and 8 for gather_qmm_rhs); anything else --
-  // mxfp8 (bits 8), mxfp4 (e8m0 scales) -- keeps the original scalar chain.
+  void set_colayout(int expert, int row, int k_start = 0) {
+    if constexpr (colayout_role != 0) {
+      colayout_expert = expert;
+      colayout_row = row + bi;
+      colayout_k_byte = k_start / pack_factor + bj * bytes_per_pack;
+      src = laguna_co_code<colayout_role>(
+          colayout_base, colayout_expert, colayout_row, colayout_k_byte);
+    }
+  }
+
+  uint8_t scale_code() const {
+    if constexpr (colayout_role != 0) {
+      return laguna_co_scale<colayout_role>(
+          colayout_base,
+          colayout_expert,
+          colayout_row,
+          colayout_k_byte * pack_factor / group_size);
+    } else {
+      return *scales;
+    }
+  }
+
   MLX_MTL_CONST bool fp4nv_fast = (bits == 4) && (group_size == 16) &&
       (bytes_per_pack == 1) && (n_reads >= 4) && ((n_reads % 4) == 0);
 
-  // Stage this thread's n_reads packed bytes into `dst`. Identical values at
-  // identical addresses on both paths; see the note above dequantize().
   void stage() const {
     if constexpr (fp4nv_fast) {
-      const float scale = fp4nv_scale_x16384(*scales);
+      const float scale = fp4nv_scale_x16384(scale_code());
       for (int i = 0; i < n_reads / 4; i++) {
         T vals[8];
         fp4nv_decode8<T>(fp4nv_pack4(src + i * 4), scale, vals);
@@ -405,7 +414,7 @@ struct QuantizedBlockLoader {
         }
       }
     } else {
-      T scale = dequantize_scale<T, group_size>(*scales);
+      T scale = dequantize_scale<T, group_size>(scale_code());
       for (int i = 0; i < n_reads; i++) {
         dequantize<T, bits>(
             src[i * bytes_per_pack], scale, dst + i * pack_factor);
@@ -444,6 +453,12 @@ struct QuantizedBlockLoader {
   }
 
   void next() {
+    if constexpr (colayout_role != 0) {
+      colayout_k_byte += tile_stride;
+      src = laguna_co_code<colayout_role>(
+          colayout_base, colayout_expert, colayout_row, colayout_k_byte);
+      return;
+    }
     src += tile_stride;
     if (reduction_dim == 1) {
       if (group_steps > 1) {
@@ -487,7 +502,6 @@ METAL_FUNC void fp_qmv_quad_impl(
   thread U x_thread[values_per_thread];
   thread U result[results_per_quadgroup] = {0};
 
-  // Adjust positions
   const int in_vec_size_w = in_vec_size / pack_factor;
   const int in_vec_size_g = in_vec_size / group_size;
   const int out_row = tid.y * quads_per_simd * results_per_quadgroup + quad_gid;
@@ -523,7 +537,7 @@ METAL_FUNC void fp_qmv_quad_impl(
   }
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, short colayout_role = 0>
 METAL_FUNC void fp_qmv_fast_impl(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -531,6 +545,7 @@ METAL_FUNC void fp_qmv_fast_impl(
     device T* y,
     const constant int& in_vec_size,
     const constant int& out_vec_size,
+    int colayout_expert,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -544,12 +559,12 @@ METAL_FUNC void fp_qmv_fast_impl(
   constexpr int scale_step_per_thread = group_size / values_per_thread;
 
   const device uint8_t* ws = (const device uint8_t*)w;
+  const device uint8_t* colayout_base = ws;
 
   typedef float U;
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
 
-  // Adjust positions
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
   const int in_vec_size_g = in_vec_size / group_size;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
@@ -563,10 +578,6 @@ METAL_FUNC void fp_qmv_fast_impl(
   for (int k = 0; k < in_vec_size; k += block_size) {
 #if defined(__METAL_VERSION__) && (__METAL_VERSION__ >= 310)
     if constexpr (group_size == 16 && bits == 4) {
-      // Same x elements into the same x_thread slots with the same
-      // per-element T -> U conversion as load_vector, using wider aligned
-      // loads (lane x offsets are multiples of values_per_thread == 16
-      // elements and rows of the fast kernel are multiples of 512 elements).
       const device vec<T, 4>* xv = (const device vec<T, 4>*)x;
 #pragma unroll
       for (int i = 0; i < values_per_thread / 4; i++) {
@@ -584,10 +595,27 @@ METAL_FUNC void fp_qmv_fast_impl(
 #endif
 
     for (int row = 0; row < results_per_simdgroup; row++) {
-      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
-      const device auto* sl = scales + row * in_vec_size_g;
+      const int logical_row = out_row + row;
+      const device uint8_t* wl;
+      uint8_t scale_byte;
+      if constexpr (colayout_role != 0) {
+        wl = laguna_co_code<colayout_role>(
+            colayout_base,
+            colayout_expert,
+            logical_row,
+            k * bytes_per_pack / pack_factor
+                + simd_lid * packs_per_thread * bytes_per_pack);
+        scale_byte = laguna_co_scale<colayout_role>(
+            colayout_base,
+            colayout_expert,
+            logical_row,
+            k / group_size + simd_lid / scale_step_per_thread);
+      } else {
+        wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        scale_byte = (scales + row * in_vec_size_g)[0];
+      }
 
-      U s = dequantize_scale<U, group_size>(sl[0]);
+      U s = dequantize_scale<U, group_size>(scale_byte);
       result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s);
     }
 
@@ -632,7 +660,6 @@ METAL_FUNC void fp_qmv_impl(
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
 
-  // Adjust positions
   const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
   const int in_vec_size_g = in_vec_size / group_size;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
@@ -643,8 +670,6 @@ METAL_FUNC void fp_qmv_impl(
     return;
   }
 
-  // In this case we need to properly guard all our reads because there isn't
-  // even 1 tile in the matrix
   if (out_vec_size < (num_simdgroups * results_per_simdgroup)) {
     ws +=
         out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
@@ -698,7 +723,6 @@ METAL_FUNC void fp_qmv_impl(
     }
   }
 
-  // In this case the last tile is moved back to redo some output values
   else {
     ws += used_out_row * in_vec_size_w +
         simd_lid * packs_per_thread * bytes_per_pack;
@@ -779,10 +803,8 @@ METAL_FUNC void fp_qvm_impl(
   thread U scale = 0;
   thread U x_local = 0;
 
-  // Adjust positions
   const int out_vec_size_w = out_vec_size * bytes_per_pack / pack_factor;
   const int out_vec_size_g = out_vec_size / group_size;
-  // 32 * (tid.y * 2 + simd_gid)
   int out_col = pack_factor * tn * (tid.y * num_simdgroups + simd_gid);
   ws += out_col * bytes_per_pack / pack_factor + simd_lid * out_vec_size_w;
   scales += out_col / group_size + simd_lid * out_vec_size_g;
@@ -793,7 +815,6 @@ METAL_FUNC void fp_qvm_impl(
     return;
   }
 
-  // Loop over in_vec in blocks of block_size
   int remaining = in_vec_size % block_size;
   if (remaining == 0) {
     for (int i = 0; i < in_vec_size; i += block_size) {
@@ -832,13 +853,11 @@ METAL_FUNC void fp_qvm_impl(
         (thread uint8_t*)&w_local, x_local, scale, result);
   }
 
-// Accumulate in the simdgroup
 #pragma clang loop unroll(full)
   for (int k = 0; k < tn * pack_factor; k++) {
     result[k] = simd_sum(result[k]);
   }
 
-  // Store the result
   if (simd_lid == 0) {
 #pragma clang loop unroll(full)
     for (int k = 0; k < tn * pack_factor; k++) {
@@ -854,7 +873,8 @@ template <
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    short colayout_role = 0>
 METAL_FUNC void fp_qmm_t_impl(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -866,6 +886,7 @@ METAL_FUNC void fp_qmm_t_impl(
     const constant int& N,
     const constant int& M,
     const constant int& K_eff,
+    const int K_start,
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
@@ -882,7 +903,6 @@ METAL_FUNC void fp_qmm_t_impl(
 
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  // Instantiate the appropriate BlockMMA and Loader
   using mma_t = mlx::steel::
       BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
   using loader_x_t =
@@ -895,9 +915,9 @@ METAL_FUNC void fp_qmm_t_impl(
       1,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits>;
+      bits,
+      colayout_role>;
 
-  // Set the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
   const int y_row = tid.y * BM;
@@ -906,15 +926,17 @@ METAL_FUNC void fp_qmm_t_impl(
   auto wl = (const device uint8_t*)w;
 
   x += y_row * static_cast<int64_t>(K);
-  wl += y_col * K_w;
-  scales += y_col * K_g;
+  if constexpr (colayout_role == 0) {
+    wl += y_col * K_w;
+    scales += y_col * K_g;
+  }
   y += y_row * static_cast<int64_t>(N) + y_col;
 
-  // Make the x loader and mma operation
   const short num_els = min(BM, M - y_row);
   const short num_outs = min(BN, N - y_col);
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
   loader_w_t loader_w(wl, scales, K, Ws, simd_gid, simd_lid);
+  loader_w.set_colayout(0, y_col, K_start);
   mma_t mma_op(simd_gid, simd_lid);
 
   if (num_els < BM) {
@@ -964,7 +986,6 @@ METAL_FUNC void fp_qmm_t_impl(
     }
   }
 
-  // Store results to device memory
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (num_els < BM || num_outs < BN) {
     mma_op.store_result_safe(y, N, short2(num_outs, num_els));
@@ -1007,7 +1028,6 @@ METAL_FUNC void fp_qmm_n_impl(
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   constexpr int BN_padded = (BN + 16 / sizeof(T));
 
-  // Instantiate the appropriate BlockMMA and Loader
   using mma_t = mlx::steel::
       BlockMMA<T, T, BM, BN, BK, WM, WN, false, false, BK_padded, BN_padded>;
   using loader_x_t = mlx::steel::
@@ -1024,7 +1044,6 @@ METAL_FUNC void fp_qmm_n_impl(
 
   auto wl = (const device uint8_t*)w;
 
-  // Set the block
   const int y_row = tid.y * BM;
   const int y_col = tid.x * BN;
   x += y_row * static_cast<int64_t>(K);
@@ -1032,7 +1051,6 @@ METAL_FUNC void fp_qmm_n_impl(
   scales += y_col / group_size;
   y += y_row * static_cast<int64_t>(N) + y_col;
 
-  // Make the x loader and mma operation
   const short num_els = min(BM, M - y_row);
   loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
   loader_w_t loader_w(wl, scales, N, Ws, simd_gid, simd_lid);
@@ -1098,7 +1116,6 @@ METAL_FUNC void fp_qmm_n_impl(
     }
   }
 
-  // Store results to device memory
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (num_els < BM) {
     mma_op.store_result_safe(y, N, short2(BN, num_els));
@@ -1122,7 +1139,6 @@ METAL_FUNC void adjust_matrix_offsets(
     const constant int64_t* w_strides,
     const constant int64_t* s_strides,
     uint3 tid [[threadgroup_position_in_grid]]) {
-  // Set the input/output matrices
   uint32_t x_idx = tid.z;
   uint32_t w_idx = tid.z;
   if (x_batch_ndims == 1) {
@@ -1163,7 +1179,6 @@ METAL_FUNC void adjust_matrix_offsets(
     const constant int64_t* w_strides,
     const constant int64_t* s_strides,
     uint3 tid [[threadgroup_position_in_grid]]) {
-  // Set the input/output matrices
   uint32_t x_idx;
   uint32_t w_idx;
   if (batch_ndims == 1) {
@@ -1231,7 +1246,7 @@ template <typename T, int group_size, int bits, int D, bool batched>
       w, scales, x, y, in_vec_size, out_vec_size, tid, quad_gid, quad_lid);
 }
 
-template <typename T, int group_size, int bits, bool batched>
+template <typename T, int group_size, int bits, bool batched, short colayout_role = 0>
 [[kernel]] void fp_qmv_fast(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -1266,8 +1281,8 @@ template <typename T, int group_size, int bits, bool batched>
         s_strides,
         tid);
   }
-  fp_qmv_fast_impl<T, group_size, bits>(
-      w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+  fp_qmv_fast_impl<T, group_size, bits, colayout_role>(
+      w, scales, x, y, in_vec_size, out_vec_size, 0, tid, simd_gid, simd_lid);
 }
 
 template <typename T, const int group_size, int bits, bool batched>
@@ -1392,11 +1407,9 @@ template <typename T, const int group_size, int bits, int split_k = 32>
       s_strides,
       tid);
 
-  // When (in_vec_size % split_k != 0) the final block needs to be smaller
   int in_vec_size_adj =
       tid.z % split_k == split_k - 1 ? final_block_size : in_vec_size;
 
-  // The in_vec_stride is the full K dimension, not the partition size
   int in_vec_stride = (split_k - 1) * in_vec_size + final_block_size;
 
   fp_qvm_impl<T, group_size, bits>(
@@ -1420,7 +1433,8 @@ template <
     const bool batched,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    short colayout_role = 0>
 [[kernel]] void fp_qmm_t(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -1463,8 +1477,8 @@ template <
         s_strides,
         tid);
   }
-  fp_qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
-      w, scales, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
+  fp_qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN, colayout_role>(
+      w, scales, x, y, Xs, Ws, K, N, M, K, 0, tid, lid, simd_gid, simd_lid);
 }
 
 template <
@@ -1523,7 +1537,7 @@ template <
       w, scales, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
-template <typename T, int group_size, int bits>
+template <typename T, int group_size, int bits, short colayout_role = 0>
 [[kernel]] void fp_gather_qmv_fast(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -1547,6 +1561,16 @@ template <typename T, int group_size, int bits>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  int colayout_expert = 0;
+  if constexpr (colayout_role != 0) {
+    if (batch_ndims == 1) {
+      colayout_expert = int(rhs_indices[tid.z * rhs_strides[0]]);
+    } else {
+      ulong2 gather_loc = elem_to_loc_broadcast(
+          tid.z, batch_shape, lhs_strides, rhs_strides, batch_ndims);
+      colayout_expert = int(rhs_indices[gather_loc.y]);
+    }
+  }
   int M = x_shape[x_batch_ndims];
   adjust_matrix_offsets(
       x,
@@ -1568,8 +1592,9 @@ template <typename T, int group_size, int bits>
       w_strides,
       s_strides,
       tid);
-  fp_qmv_fast_impl<T, group_size, bits>(
-      w, scales, x, y, in_vec_size, out_vec_size, tid, simd_gid, simd_lid);
+  fp_qmv_fast_impl<T, group_size, bits, colayout_role>(
+      w, scales, x, y, in_vec_size, out_vec_size, colayout_expert,
+      tid, simd_gid, simd_lid);
 }
 
 template <typename T, int group_size, int bits>
@@ -1686,7 +1711,8 @@ template <
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    short colayout_role = 0>
 [[kernel]] void fp_gather_qmm_t(
     const device uint32_t* w,
     const device uint8_t* scales,
@@ -1740,7 +1766,7 @@ template <
       s_strides,
       tid);
   fp_qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
-      w, scales, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
+      w, scales, x, y, Xs, Ws, K, N, M, K, 0, tid, lid, simd_gid, simd_lid);
 }
 
 template <
@@ -1750,7 +1776,8 @@ template <
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    short colayout_role = 0>
 [[kernel]] void fp_qmm_t_splitk(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -1776,11 +1803,13 @@ template <
   x += k_start;
 
   auto wl = (const device uint8_t*)w;
-  wl += k_start * bytes_per_pack / pack_factor;
-  scales += k_start / group_size;
+  if constexpr (colayout_role == 0) {
+    wl += k_start * bytes_per_pack / pack_factor;
+    scales += k_start / group_size;
+  }
   y += tid.z * static_cast<int64_t>(split_k_partition_stride);
 
-  fp_qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN>(
+  fp_qmm_t_impl<T, group_size, bits, aligned_N, BM, BK, BN, colayout_role>(
       (const device uint32_t*)wl,
       scales,
       x,
@@ -1791,6 +1820,7 @@ template <
       N,
       M,
       k_partition_size,
+      k_start,
       tid,
       lid,
       simd_gid,
@@ -1804,7 +1834,8 @@ template <
     const bool aligned_N,
     const int BM = 32,
     const int BK = 32,
-    const int BN = 32>
+    const int BN = 32,
+    short colayout_role = 0>
 [[kernel]] void fp_qmm_t_splitk_fused(
     const device uint32_t* w [[buffer(0)]],
     const device uint8_t* scales [[buffer(1)]],
@@ -1818,10 +1849,6 @@ template <
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  // Single-dispatch replay of the exact split-K arithmetic: per partition
-  // the SAME loader/MMA schedule as fp_qmm_t_impl, the partition store's
-  // T-round emulated in-register, partitions FP32-chained in the reduce's
-  // order, final store via the standard BlockMMA path (same output round).
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
 
@@ -1845,7 +1872,8 @@ template <
       1,
       WM * WN * SIMD_SIZE,
       group_size,
-      bits>;
+      bits,
+      colayout_role>;
 
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[BN * BK_padded];
@@ -1858,8 +1886,10 @@ template <
   auto wl = (const device uint8_t*)w;
 
   const device T* x_row = x + y_row * static_cast<int64_t>(K);
-  wl += y_col * K_w;
-  scales += y_col * K_g;
+  if constexpr (colayout_role == 0) {
+    wl += y_col * K_w;
+    scales += y_col * K_g;
+  }
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   const short num_els = min(BM, M - y_row);
@@ -1877,15 +1907,18 @@ template <
   for (int p = 0; p < num_partitions; p++) {
     const int k_start = p * k_partition_size;
     const device T* xp = x_row + k_start;
-    const device uint8_t* wlp = wl + k_start * bytes_per_pack / pack_factor;
-    const device uint8_t* scp = scales + k_start / group_size;
+    const device uint8_t* wlp = colayout_role == 0
+        ? wl + k_start * bytes_per_pack / pack_factor
+        : wl;
+    const device uint8_t* scp = colayout_role == 0
+        ? scales + k_start / group_size
+        : scales;
 
     loader_x_t loader_x(xp, K, Xs, simd_gid, simd_lid);
     loader_w_t loader_w(wlp, scp, K, Ws, simd_gid, simd_lid);
+    loader_w.set_colayout(0, y_col, k_start);
     mma_t mma_op(simd_gid, simd_lid);
 
-    // Host guard requires M % BM == 0 and N % BN == 0 (and aligned_N), so
-    // only the all-aligned load path of fp_qmm_t_impl is replayed here.
     for (int k = 0; k < k_partition_size; k += BK) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
       loader_x.load_unsafe();
@@ -1896,9 +1929,6 @@ template <
       loader_w.next();
     }
 
-    // Emulated partition store: T-round each accumulator element exactly as
-    // store_result's U-cast would have, then FP32-chain in partition order
-    // exactly as the strided reduce summed the old bf16 intermediate.
     STEEL_PRAGMA_UNROLL
     for (short i = 0; i < kfrag; i++) {
       run_sum[i] += static_cast<float>(static_cast<T>(mma_op.Ctile.elems()[i]));
@@ -2035,7 +2065,6 @@ template <
   threadgroup T Xs[BM * BK_padded];
   threadgroup T Ws[transpose ? BN * BK_padded : BK * BN_padded];
 
-  // Compute the block
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
   const int N_w = N * bytes_per_pack / pack_factor;
@@ -2048,24 +2077,20 @@ template <
   const size_t y_row_long = size_t(y_row);
   const size_t y_col_long = size_t(y_col);
 
-  // Prepare threadgroup bounds
   const short tgp_bm = align_M ? BM : short(min(BM, M - y_row));
   const short tgp_bn = align_N ? BN : short(min(BN, N - y_col));
 
-  // Calculate the final tiles in the case that K is not aligned
   const int k_remain = K - K_it * BK;
   const short2 tile_x = short2(k_remain, tgp_bm);
   const short2 tile_w =
       transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
 
-  // Move x and output to the correct block
   auto wl = (const device uint8_t*)w;
   x += y_row_long * K;
   y += y_row_long * N + y_col_long;
   wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
   scales += transpose ? y_col_long * K_g : y_col / group_size;
 
-  // Do as many matmuls as necessary
   uint32_t index;
   short offset;
   uint32_t index_next = indices[y_row];
@@ -2085,10 +2110,8 @@ template <
     }
     threadgroup_barrier(mem_flags::mem_none);
 
-    // Prepare threadgroup mma operation
     thread mma_t mma_op(simd_group_id, simd_lane_id);
 
-    // Prepare threadgroup loading operations
     thread loader_x_t loader_x(x, K, Xs, simd_group_id, simd_lane_id);
     thread loader_w_t loader_w(
         wl + index * stride_w,
@@ -2098,7 +2121,6 @@ template <
         simd_group_id,
         simd_lane_id);
 
-    // Matrices are all aligned check nothing
     if (align_M && align_N) {
       gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
       if (!align_K) {
@@ -2106,7 +2128,6 @@ template <
         gemm_loop_finalize(Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
       }
 
-      // Store results to device memory
       if (offset_next - offset == BM) {
         mma_op.store_result(y, N);
       } else {
@@ -2114,7 +2135,6 @@ template <
             y, N, short2(0, offset), short2(BN, offset_next));
       }
     } else {
-      // Tile aligned so check outside of the hot loop
       if ((align_M || tgp_bm == BM) && (align_N || tgp_bn == BN)) {
         gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
         if (!align_K) {
@@ -2123,7 +2143,6 @@ template <
               Xs, Ws, mma_op, loader_x, loader_w, tile_x, tile_w);
         }
 
-        // Store results to device memory
         if (offset_next - offset == BM) {
           mma_op.store_result(y, N);
         } else {
@@ -2132,7 +2151,6 @@ template <
         }
       }
 
-      // Tile partially aligned check rows
       else if (align_N || tgp_bn == BN) {
         gemm_loop_unaligned<false, true, transpose>(
             Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
@@ -2145,7 +2163,6 @@ template <
             y, N, short2(0, offset), short2(BN, offset_next));
       }
 
-      // Tile partially aligned check cols
       else if (align_M || tgp_bm == BM) {
         gemm_loop_unaligned<true, false, transpose>(
             Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);
@@ -2158,7 +2175,6 @@ template <
             y, N, short2(0, offset), short2(tgp_bn, offset_next));
       }
 
-      // Nothing aligned so check both rows and cols
       else {
         gemm_loop_unaligned<false, false, transpose>(
             Xs, Ws, mma_op, loader_x, loader_w, K_it, tgp_bm, tgp_bn, BK);

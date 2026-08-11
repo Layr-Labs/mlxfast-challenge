@@ -249,7 +249,8 @@ void qmv(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    int colayout_role = 0) {
   int B = out.size() / M / N;
 
   int bn = 8;
@@ -261,6 +262,10 @@ void qmv(
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   bool fast = N % bn == 0 && K % 512 == 0;
+  if (colayout_role != 0 && !fast) {
+    throw std::runtime_error(
+        "[qmv] Laguna co-layout marker reached non-fast QMV");
+  }
 
   concatenate(
       kname,
@@ -270,7 +275,8 @@ void qmv(
       group_size,
       "_b_",
       bits,
-      B > 1 ? "_batch_1" : "_batch_0");
+      B > 1 ? "_batch_1" : "_batch_0",
+      colayout_role ? "_co_" + std::to_string(colayout_role) : "");
   auto kernel = get_quantized_kernel_wrapped(
       d,
       kname,
@@ -279,7 +285,8 @@ void qmv(
       type_string,
       group_size,
       bits,
-      B > 1);
+      B > 1,
+      colayout_role);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -488,7 +495,8 @@ void qmm_nax(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    int colayout_role = 0) {
   int B = out.size() / M / N;
 
   int wm = 2;
@@ -538,7 +546,8 @@ void qmm_nax(
              "_alM_" + (aligned_M ? "true" : "false"))
           : "",
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
-      batched ? "_batch_1" : "_batch_0");
+      batched ? "_batch_1" : "_batch_0",
+      colayout_role ? "_co_" + std::to_string(colayout_role) : "");
   std::string template_def;
   MTL::ComputePipelineState* kernel;
   if (use_static_laguna_shape) {
@@ -557,7 +566,9 @@ void qmm_nax(
         bk,
         bn,
         wm,
-        wn);
+        wn,
+        "bfloat",
+        colayout_role);
   } else if (transpose) {
     kernel = get_qmm_nax_kernel_wrapped(
         d,
@@ -573,7 +584,9 @@ void qmm_nax(
         bk,
         bn,
         wm,
-        wn);
+        wn,
+        "bfloat",
+        colayout_role);
   } else {
     kernel = get_qmm_nax_kernel_wrapped(
         d,
@@ -729,7 +742,8 @@ void qmm(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    int colayout_role = 0) {
   if (metal::is_nax_available() && transpose && (K % 64 == 0) &&
       (env::enable_tf32() || x.dtype() != float32)) {
     return qmm_nax(
@@ -746,7 +760,8 @@ void qmm(
         /* int K = */ K,
         /* metal::Device& d = */ d,
         /* const Stream& s = */ s,
-        /* const std::string& mode = */ mode);
+        /* const std::string& mode = */ mode,
+        /* int colayout_role = */ colayout_role);
   }
 
   int B = out.size() / M / N;
@@ -772,7 +787,8 @@ void qmm(
       "_b_",
       bits,
       transpose ? (aligned ? "_alN_true" : "_alN_false") : "",
-      batched ? "_batch_1" : "_batch_0");
+      batched ? "_batch_1" : "_batch_0",
+      colayout_role ? "_co_" + std::to_string(colayout_role) : "");
   std::string template_def;
   MTL::ComputePipelineState* kernel;
   if (transpose) {
@@ -785,7 +801,11 @@ void qmm(
         group_size,
         bits,
         aligned,
-        batched);
+        batched,
+        32,
+        32,
+        32,
+        colayout_role);
   } else {
     kernel = get_quantized_kernel_wrapped(
         d, kname, "qmm_n", mode, type_string, group_size, bits, batched);
@@ -822,7 +842,8 @@ void qmm_splitk(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    int colayout_role = 0) {
   // Choose split_k to target ~512 threadgroups
   int bm = 32, bn = 32;
   int n_tiles = (N + bn - 1) / bn;
@@ -843,7 +864,8 @@ void qmm_splitk(
   }
   if (split_k <= 1) {
     return qmm(
-        x, w, scales, biases, out, true, group_size, bits, M, N, K, d, s, mode);
+        x, w, scales, biases, out, true, group_size, bits, M, N, K, d, s, mode,
+        colayout_role);
   }
 
   int k_partition_size = K / split_k;
@@ -876,9 +898,11 @@ void qmm_splitk(
         group_size,
         "_b_",
         bits,
-        aligned ? "_alN_true" : "_alN_false");
+        aligned ? "_alN_true" : "_alN_false",
+        colayout_role ? "_co_" + std::to_string(colayout_role) : "");
     auto kernel = get_quantized_kernel_wrapped(
-        d, kname, "qmm_t_splitk_fused", mode, type_string, group_size, bits, aligned);
+        d, kname, "qmm_t_splitk_fused", mode, type_string, group_size, bits,
+        aligned, 32, 32, 32, colayout_role);
     compute_encoder.set_compute_pipeline_state(kernel);
     int c = 0;
     compute_encoder.set_input_array(w, c++);
@@ -921,9 +945,11 @@ void qmm_splitk(
       group_size,
       "_b_",
       bits,
-      aligned ? "_alN_true" : "_alN_false");
+      aligned ? "_alN_true" : "_alN_false",
+      colayout_role ? "_co_" + std::to_string(colayout_role) : "");
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qmm_t_splitk", mode, type_string, group_size, bits, aligned);
+      d, kname, "qmm_t_splitk", mode, type_string, group_size, bits, aligned,
+      32, 32, 32, colayout_role);
 
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1058,7 +1084,8 @@ void gather_qmv(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    int colayout_role = 0) {
   int B = out.size() / M / N;
 
   int bn = 8;
@@ -1070,6 +1097,10 @@ void gather_qmv(
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   bool fast = N % bn == 0 && K % 512 == 0;
+  if (colayout_role != 0 && !fast) {
+    throw std::runtime_error(
+        "[gather_qmv] Laguna co-layout marker reached non-fast gather QMV");
+  }
   concatenate(
       kname,
       mode + (fast ? "_gather_qmv_fast_" : "_gather_qmv_"),
@@ -1077,7 +1108,8 @@ void gather_qmv(
       "_gs_",
       group_size,
       "_b_",
-      bits);
+      bits,
+      colayout_role ? "_co_" + std::to_string(colayout_role) : "");
 
   auto kernel = get_quantized_kernel_wrapped(
       d,
@@ -1086,7 +1118,8 @@ void gather_qmv(
       mode,
       type_string,
       group_size,
-      bits);
+      bits,
+      colayout_role);
 
   auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -1547,23 +1580,6 @@ bool darkbloom_stage_wide_load_ok(
 
 } // namespace
 
-// DARKBLOOM_GATHER_XMAJOR: fold this many ADJACENT BN-wide column tiles of
-// the expert-aligned gather-QMM into one threadgroup, so each threadgroup
-// loads the expert run's x fragments once per k-tile and reuses them across
-// the fold -- x DRAM traffic divides by the fold, weight traffic unchanged
-// (the chains are DRAM-bound with x re-reads ~half the bytes, see
-// notes/exp-stage2.md section 4.3). "1" selects the tuned default fold;
-// explicit 2/4/8/16 override it, anything else is OFF. Parsed once per
-// process. MUST stay in lockstep with the JIT define injected in
-// jit_kernels.cpp (get_qmm_nax_kernel calls this same function): the
-// dispatch divides grid.x by exactly the value the kernel was compiled
-// with.
-int darkbloom_gather_xmajor_ct() {
-  // XMAJOR kernel arms removed with the dead staging code; keep the
-  // dispatch/JIT contract coherent by pinning the fold OFF.
-  return 0;
-}
-
 // DARKBLOOM_SWIGLU_REGLOCAL: register-local swiglu epilogue in the
 // expert-aligned gather-QMM (fp_gather_qmm_rhs_expert_nax). With the
 // shipped variant-5 tiling (WN=1: one simdgroup owns the full BN=64 column
@@ -1635,6 +1651,70 @@ bool laguna_expert_bounds_sidecar_storage(const array& indices, int M) {
       !indices.flags().col_contiguous;
 }
 
+// Fail-closed marker for Laguna's replacement-only NVFP4 bank.  The Swift
+// runtime gives weight and scale parameters shape-correct zero-stride views of
+// the same 286,327,040-byte gate/up allocation. No ordinary tensor can enter this
+// path by shape alone: dtype, shared buffer, byte offset, role stride and every
+// logical dimension must agree before row-contiguity normalization is skipped.
+int laguna_nvfp4_colayout_role(const array& w, const array& scales) {
+  constexpr size_t bank_bytes = 286327040;
+  constexpr int64_t shared_gu_offset = 285212800;
+  constexpr int64_t routed_down_offset = 286327040;
+  constexpr int64_t shared_down_offset = 428933504;
+  if (w.dtype() != uint32 || scales.dtype() != uint8 ||
+      w.ndim() != scales.ndim() || w.ndim() < 2 ||
+      w.data_shared_ptr() != scales.data_shared_ptr() ||
+      w.buffer_size() < bank_bytes || scales.buffer_size() < bank_bytes ||
+      w.offset() != scales.offset() || w.strides().back() != 0 ||
+      scales.strides().back() != 0) {
+    return 0;
+  }
+  const int role = int(w.strides()[w.ndim() - 2]);
+  if (role < 1 || role > 7 || role == 4 ||
+      scales.strides()[scales.ndim() - 2] != role) {
+    return 0;
+  }
+  for (int i = 0; i < w.ndim() - 2; ++i) {
+    if (w.strides()[i] != 0 || scales.strides()[i] != 0) {
+      return 0;
+    }
+  }
+  auto shape3 = [&](int e, int n, int kw, int ks) {
+    return w.ndim() == 3 && w.shape(0) == e && w.shape(1) == n &&
+        w.shape(2) == kw && scales.shape(0) == e &&
+        scales.shape(1) == n && scales.shape(2) == ks;
+  };
+  auto shape2 = [&](int n, int kw, int ks) {
+    return w.ndim() == 2 && w.shape(0) == n && w.shape(1) == kw &&
+        scales.shape(0) == n && scales.shape(1) == ks;
+  };
+  bool shape_ok = false;
+  int64_t expected_offset = 0;
+  switch (role) {
+    case 1:
+    case 2: shape_ok = shape3(256, 512, 256, 128); break;
+    case 3: shape_ok = shape3(256, 1024, 256, 128); break;
+    case 4:
+      shape_ok = shape3(256, 2048, 64, 32);
+      expected_offset = routed_down_offset;
+      break;
+    case 5:
+    case 6:
+      shape_ok = shape2(512, 256, 128);
+      expected_offset = shared_gu_offset;
+      break;
+    case 7:
+      shape_ok = shape2(1024, 256, 128);
+      expected_offset = shared_gu_offset;
+      break;
+    case 8:
+      shape_ok = shape2(2048, 64, 32);
+      expected_offset = shared_down_offset;
+      break;
+  }
+  return shape_ok && w.offset() == expected_offset ? role : 0;
+}
+
 void gather_qmm_rhs_nax(
     const array& x_,
     const array& w_,
@@ -1650,7 +1730,8 @@ void gather_qmm_rhs_nax(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string mode) {
+    const std::string mode,
+    int colayout_role = 0) {
   const bool expert_bounds_candidate =
       laguna_expert_bounds_sidecar_candidate(indices_, M);
   const bool expert_bounds_sidecar =
@@ -1686,15 +1767,20 @@ void gather_qmm_rhs_nax(
 
   // Normalize the input arrays
   array x = broadcast_with_indices(x_);
-  array w = ensure_row_contiguous(w_, d, s);
+  const int verified_colayout = laguna_nvfp4_colayout_role(w_, scales_);
+  if (verified_colayout != colayout_role) {
+    throw std::runtime_error("[gather_qmm] Laguna co-layout role drift");
+  }
+  array w = colayout_role != 0 ? w_ : ensure_row_contiguous(w_, d, s);
   // Laguna's certified packed decode scale bank is exposed to this prefill
   // primitive through a bounded shape-preserving view. Its exact expert shape,
   // zero last-axis stride, and layout-specific 64-byte or 16-byte compact-row
   // strides form a fail-closed marker; the kernel consumes the inherited
   // packed bytes directly. Every ordinary scale array retains the stock
   // normalization path.
-  const int pairwise_scale_layout =
-      laguna_expert_pairwise_scale_layout(scales_);
+  const int pairwise_scale_layout = colayout_role != 0
+      ? colayout_role + 8
+      : laguna_expert_pairwise_scale_layout(scales_);
   array scales = pairwise_scale_layout != 0
       ? scales_
       : ensure_row_contiguous(scales_, d, s);
@@ -1730,7 +1816,9 @@ void gather_qmm_rhs_nax(
       align_N && align_K && bm == 64 && wm == 4 && (wn == 2 || wn == 1);
   const bool pairwise_shape =
       (pairwise_scale_layout == 1 && K == 2048 && N == 1024) ||
-      (pairwise_scale_layout == 2 && K == 512 && N == 2048);
+      (pairwise_scale_layout == 2 && K == 512 && N == 2048) ||
+      (pairwise_scale_layout == 11 && K == 2048 && N == 1024) ||
+      (pairwise_scale_layout == 12 && K == 512 && N == 2048);
   const int expert_pairwise_scale_layout =
       pairwise_scale_layout != 0 && expert_aligned && mode == "nvfp4" &&
               pairwise_shape && scales_.shape(-1) == K / group_size
@@ -1749,7 +1837,12 @@ void gather_qmm_rhs_nax(
   if (expert_aligned && expert_pairwise_scale_layout != 0 &&
       darkbloom_stage_flag("DARKBLOOM_STAGE_TRACE")) {
     static std::once_flag eb_once[4];
-    const int eb_trace_slot = 2 * (expert_pairwise_scale_layout - 1) +
+    const int eb_projection_slot =
+        (expert_pairwise_scale_layout == 1 ||
+         expert_pairwise_scale_layout == 11)
+        ? 0
+        : 1;
+    const int eb_trace_slot = 2 * eb_projection_slot +
         (expert_bounds_sidecar ? 1 : 0);
     std::call_once(eb_once[eb_trace_slot], [&]() {
       fprintf(
@@ -1785,67 +1878,9 @@ void gather_qmm_rhs_nax(
   // retained, so each bank's certification -- and therefore its kernel name
   // -- is stable for the process lifetime, and warmup compiles both
   // pipelines before the first scored request.
-  const bool expert_wideld = expert_aligned &&
+  const bool expert_wideld = colayout_role == 0 && expert_aligned &&
       darkbloom_expert_stage_wideld() &&
       darkbloom_stage_wide_load_ok(w, transpose, bits, N, K, bn);
-
-  // DARKBLOOM_STAGE2_GATHER ground truth at the DISPATCH site. The define
-  // itself is injected at JIT assembly (jit_kernels.cpp, expert kernels
-  // only); this one-shot line proves a flagged run actually dispatches the
-  // expert-aligned path that define targets -- the exact confound that made
-  // the STAGE_WIDEST/WIDELD arms measure their own control (those function
-  // constants only ever reached the non-expert kernel). "active" requires
-  // BOTH the flag and the expert path; a declining guard prints "inactive".
-  {
-    static const bool stage2_flag =
-        env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
-    static const bool trace_fusion =
-        env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1";
-    if (stage2_flag || trace_fusion) {
-      static std::once_flag stage2_once;
-      std::call_once(stage2_once, [&]() {
-        fprintf(
-            stderr,
-            "mlxfast: fusion %s: stage2_gather "
-            "(dispatch expert=%d egroups=%d N=%d K=%d M=%d)\n",
-            (stage2_flag && expert_aligned) ? "active" : "inactive",
-            int(expert_aligned),
-            egroups,
-            N,
-            K,
-            M);
-      });
-    }
-  }
-
-  // DARKBLOOM_GATHER_XMAJOR ground truth at the DISPATCH site, same
-  // contract as the stage2 line above: "active" requires BOTH the flag and
-  // the expert path (the define is only injected into expert kernels), so a
-  // declining guard prints "inactive" instead of silently measuring the
-  // control.
-  {
-    static const int xmajor_trace_ct = darkbloom_gather_xmajor_ct();
-    static const bool trace_fusion =
-        env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1";
-    if (xmajor_trace_ct > 1 || trace_fusion) {
-      static std::once_flag xmajor_once;
-      std::call_once(xmajor_once, [&]() {
-        fprintf(
-            stderr,
-            "mlxfast: fusion %s: gatherx "
-            "(dispatch expert=%d ct=%d grid_x=%d N=%d K=%d M=%d)\n",
-            (xmajor_trace_ct > 1 && expert_aligned) ? "active" : "inactive",
-            int(expert_aligned),
-            xmajor_trace_ct,
-            (xmajor_trace_ct > 1 && expert_aligned)
-                ? (N / bn) / xmajor_trace_ct
-                : (N + bn - 1) / bn,
-            N,
-            K,
-            M);
-      });
-    }
-  }
 
   // Make the kernel name
   std::string kname;
@@ -1899,7 +1934,7 @@ void gather_qmm_rhs_nax(
   // only needs the threadgroup one (Ws is 16B aligned by construction in the
   // kernel). Both are resolved once per process, so the specialization key is
   // fixed for the process lifetime.
-  const bool wide_ok =
+  const bool wide_ok = colayout_role == 0 &&
       darkbloom_stage_wide_load_ok(w, transpose, bits, N, K, bn);
   const bool stage_widest = darkbloom_stage_widest();
   const bool stage_wideld = darkbloom_stage_wideld() && wide_ok;
@@ -2024,13 +2059,8 @@ void gather_qmm_rhs_nax(
   compute_encoder.set_compute_pipeline_state(kernel);
 
   MTL::Size group_dims(32, wn, wm);
-  // DARKBLOOM_GATHER_XMAJOR: the expert kernel was compiled to walk
-  // xmajor_ct adjacent column tiles per threadgroup, so grid.x shrinks by
-  // the same factor. N is certified 1024 or 2048 on the expert path (bn=64),
-  // so the division is always exact.
-  const int xmajor_ct = expert_aligned ? darkbloom_gather_xmajor_ct() : 0;
   MTL::Size grid_dims(
-      xmajor_ct > 1 ? (N / bn) / xmajor_ct : ((N + bn - 1) / bn),
+      (N + bn - 1) / bn,
       expert_aligned ? egroups : (M + bm - 1) / bm,
       1);
 
@@ -2067,7 +2097,8 @@ void gather_qmm_rhs(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string mode) {
+    const std::string mode,
+    int colayout_role = 0) {
   if (metal::is_nax_available() && transpose &&
       (env::enable_tf32() || x_.dtype() != float32)) {
     return gather_qmm_rhs_nax(
@@ -2085,7 +2116,12 @@ void gather_qmm_rhs(
         /* int K = */ K,
         /* metal::Device& d = */ d,
         /* const Stream& s = */ s,
-        /* const std::string mode = */ mode);
+        /* const std::string mode = */ mode,
+        /* int colayout_role = */ colayout_role);
+  }
+  if (colayout_role != 0) {
+    throw std::runtime_error(
+        "[gather_qmm] Laguna co-layout sorted RHS requires NAX");
   }
 
   if (laguna_expert_bounds_sidecar_candidate(indices_, M)) {
@@ -2220,13 +2256,19 @@ void dispatch_qmv(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string& mode) {
+    const std::string& mode,
+    int colayout_role = 0) {
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
   if ((K == 128 || K == 64) && is_power_of_2(bits)) {
+    if (colayout_role != 0) {
+      throw std::runtime_error(
+          "[quantized_matmul] Laguna co-layout marker reached qmv_quad");
+    }
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
     return;
   }
-  qmv(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+  qmv(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode,
+      colayout_role);
 }
 
 void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -2238,8 +2280,14 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Make sure the last two dims of x and w, s, b are contiguous. This should
   // be relaxed for x.
   array x = ensure_row_contiguous_matrix(inputs[0], d, s);
-  array w = ensure_row_contiguous_matrix(inputs[1], d, s);
-  array scales = ensure_row_contiguous_matrix(inputs[2], d, s);
+  const int colayout_role =
+      laguna_nvfp4_colayout_role(inputs[1], inputs[2]);
+  array w = colayout_role != 0
+      ? inputs[1]
+      : ensure_row_contiguous_matrix(inputs[1], d, s);
+  array scales = colayout_role != 0
+      ? inputs[2]
+      : ensure_row_contiguous_matrix(inputs[2], d, s);
   std::optional<array> biases = std::nullopt;
   if (inputs.size() == 4) {
     biases = ensure_row_contiguous_matrix(inputs[3], d, s);
@@ -2253,13 +2301,23 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
+  const bool colayout_contract = colayout_role == 0 ||
+      ((colayout_role >= 5 && colayout_role <= 8) && transpose_ &&
+       group_size_ == 16 && bits_ == 4 && mode == "nvfp4" &&
+       !biases.has_value());
+  if (!colayout_contract) {
+    throw std::runtime_error(
+        "[quantized_matmul] Laguna co-layout marker reached an unsupported "
+        "dispatch");
+  }
   // It is a matrix matrix product.
   if (M >= vector_limit) {
     // Use split-K qmm for small M with transposed weights (non-batched only)
     int B = out.size() / M / N;
     if (transpose_ && B == 1) {
       qmm_splitk(
-          x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
+          x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode,
+          colayout_role);
       return;
     }
     qmm(x,
@@ -2282,7 +2340,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   // Run of the mill qmv
   if (transpose_) {
     dispatch_qmv(
-        x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
+        x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode,
+        colayout_role);
     return;
   }
 
@@ -2305,12 +2364,16 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   out.set_data(allocator::malloc(out.nbytes()));
 
   array x = ensure_row_contiguous_matrix(inputs[0], d, s);
-  array w = ensure_row_contiguous_matrix(inputs[1], d, s);
+  const int colayout_role =
+      laguna_nvfp4_colayout_role(inputs[1], inputs[2]);
+  array w = colayout_role != 0
+      ? inputs[1]
+      : ensure_row_contiguous_matrix(inputs[1], d, s);
   const int pairwise_scale_layout =
       laguna_expert_pairwise_scale_layout(inputs[2]);
   // Preserve the exact zero-copy marker for the dedicated NAX loader. Every
   // ordinary array keeps the stock row-contiguous normalization.
-  array scales = pairwise_scale_layout != 0
+  array scales = (pairwise_scale_layout != 0 || colayout_role != 0)
       ? inputs[2]
       : ensure_row_contiguous_matrix(inputs[2], d, s);
   std::optional<array> biases = std::nullopt;
@@ -2327,6 +2390,14 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int E = w.size() / w.shape(-1) / w.shape(-2);
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
+  const bool colayout_contract = colayout_role == 0 ||
+      ((colayout_role >= 1 && colayout_role <= 4) && transpose_ &&
+       group_size_ == 16 && bits_ == 4 && mode == "nvfp4" &&
+       !biases.has_value());
+  if (!colayout_contract) {
+    throw std::runtime_error(
+        "[gather_qmm] Laguna co-layout marker reached an unsupported dispatch");
+  }
 
   const bool sorted_rhs =
       M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4;
@@ -2339,17 +2410,24 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
     throw std::runtime_error(
         "[gather_qmm] malformed Laguna expert-bounds sidecar storage");
   }
+  const bool expert_bounds_scale_carrier =
+      (K == 2048 && N == 1024 &&
+       (pairwise_scale_layout == 1 || colayout_role == 3)) ||
+      (K == 512 && N == 2048 && pairwise_scale_layout == 2);
   const bool expert_bounds_outer_contract =
       expert_bounds_sidecar && sorted_rhs && metal::is_nax_available() &&
       transpose_ && group_size_ == 16 && bits_ == 4 && mode == "nvfp4" &&
       !biases.has_value() && x.dtype() == bfloat16 && E == 256 &&
       darkbloom_expert_aligned_gather() &&
-      ((pairwise_scale_layout == 1 && K == 2048 && N == 1024) ||
-       (pairwise_scale_layout == 2 && K == 512 && N == 2048));
+      expert_bounds_scale_carrier;
   if (expert_bounds_sidecar && !expert_bounds_outer_contract) {
     throw std::runtime_error(
         "[gather_qmm] Laguna expert-bounds sidecar reached an unsupported "
         "outer dispatch");
+  }
+  if (colayout_role != 0 && sorted_rhs && !metal::is_nax_available()) {
+    throw std::runtime_error(
+        "[gather_qmm] Laguna co-layout sorted RHS requires NAX");
   }
   const bool pairwise_contract =
       sorted_rhs && metal::is_nax_available() && transpose_ &&
@@ -2383,12 +2461,17 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         K,
         d,
         s,
-        mode);
+        mode,
+        colayout_role);
     return;
   }
 
   // It is a matrix matrix product
   if (M >= vector_limit) {
+    if (colayout_role != 0) {
+      throw std::runtime_error(
+          "[gather_qmm] Laguna co-layout marker reached generic gather QMM");
+    }
     gather_qmm(
         x,
         w,
@@ -2425,7 +2508,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         K,
         d,
         s,
-        mode);
+        mode,
+        colayout_role);
     return;
   }
 
