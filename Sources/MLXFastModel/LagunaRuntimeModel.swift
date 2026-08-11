@@ -11193,7 +11193,7 @@ final class LagunaRuntimeDecoderLayer: Module {
 /// bits. The stock embedding and the two stock probe RoPE calls produce the
 /// same three output buffers separately.
 private let lagunaDecodeEmbeddingRoPEAtlasKernel = MLXFast.metalKernel(
-    name: "laguna_decode_embedding_rope_atlas_bf16_2048_v2",
+    name: "laguna_decode_embedding_rope_atlas_bf16_2048_v3_tg128",
     inputNames: [
         "tokens", "embedding_weight", "full_atlas", "sliding_atlas",
         "atlas_position",
@@ -11201,7 +11201,6 @@ private let lagunaDecodeEmbeddingRoPEAtlasKernel = MLXFast.metalKernel(
     outputNames: ["hidden", "full_angles", "sliding_angles"],
     source: """
 constexpr uint hidden_size = 2048;
-constexpr uint hidden_vectors = hidden_size / 4;
 constexpr uint full_width = 64;
 constexpr uint sliding_width = 128;
 
@@ -11214,9 +11213,10 @@ const device vec<bfloat, 4>* embedding_vectors =
         embedding_weight + token * hidden_size);
 device vec<bfloat, 4>* hidden_vectors_out =
     (device vec<bfloat, 4>*)(hidden);
-if (lane < hidden_vectors) {
-    hidden_vectors_out[lane] = embedding_vectors[lane];
-}
+hidden_vectors_out[lane] = embedding_vectors[lane];
+hidden_vectors_out[lane + 128] = embedding_vectors[lane + 128];
+hidden_vectors_out[lane + 256] = embedding_vectors[lane + 256];
+hidden_vectors_out[lane + 384] = embedding_vectors[lane + 384];
 
 if (lane < full_width / 4) {
     const device vec<float, 4>* atlas_vectors =
@@ -11265,8 +11265,8 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
     ]
     let outputs = lagunaDecodeEmbeddingRoPEAtlasKernel(
         kernelInputs,
-        grid: (512, 1, 1),
-        threadGroup: (512, 1, 1),
+        grid: (128, 1, 1),
+        threadGroup: (128, 1, 1),
         outputShapes: [
             [1, 1, LagunaConstants.hiddenSize],
             [1, 1, 1, LagunaConstants.headDim / 2],
@@ -11440,8 +11440,9 @@ final class LagunaRuntimeModelInner: Module {
         var fullRoPEAngles: MLXArray?
         var slidingRoPEAngles: MLXArray?
         var qkRoPEOffsets: MLXArray?
+        let decodeAtlasPosition = decodeRoPEAtlasPosition(inputs: inputs, cache: cache)
         if lagunaRoPEAngleAtlasEnabled,
-            let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
+            let position = decodeAtlasPosition,
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas,
             let atlasOutputs = lagunaDecodeEmbeddingRoPEAtlas(
@@ -11455,7 +11456,7 @@ final class LagunaRuntimeModelInner: Module {
             fullRoPEAngles = atlasOutputs.fullAngles
             slidingRoPEAngles = atlasOutputs.slidingAngles
         } else if lagunaRoPEAtlasViewsEnabled,
-            let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
+            let position = decodeAtlasPosition,
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas
         {
@@ -11519,9 +11520,14 @@ final class LagunaRuntimeModelInner: Module {
         // layer's cache offset: all full-attention caches advance in
         // lockstep, as do all sliding caches (vendored `LagunaModelInner`
         // convention).
-        let fullMask = createAttentionMask(h: h, cache: cache?[fullAttentionIdx])
-        let slidingMask = createAttentionMask(
-            h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
+        let fullMask =
+            decodeAtlasPosition == nil
+            ? createAttentionMask(h: h, cache: cache?[fullAttentionIdx]) : .none
+        let slidingMask =
+            decodeAtlasPosition == nil
+            ? createAttentionMask(
+                h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
+            : .none
 
         let isSingleTokenDecode = inputs.dims(1, 1)
 
