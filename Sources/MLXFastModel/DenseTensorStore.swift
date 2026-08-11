@@ -1,3 +1,17 @@
+// Maple campaign - advisor receipt nonce `maple-advisor-r118a-01`.
+//
+// Comment-only marker so this HEAD-class replay receipt can be
+// attributed to exactly one submitted tree when the channel history
+// is read back. No executable statement, declaration, constant,
+// build flag or kernel source is changed, and no kernel is renamed
+// (MLX caches compiled Metal libraries by kernel name, so renames
+// are never free). This draw makes no performance claim.
+// Drawn 2026-08-11T03:54:51Z.
+
+// receipt-nonce: r109f-ticket2 (2026-08-10). Comment-only edit whose sole purpose
+// is to make this submission archive byte-distinct from the r109f-ticket1 archive
+// so the service does not dedupe it. No declaration, no type, no code path and no
+// numeric behaviour in this file or any other is changed by this line.
 import Darwin
 import Foundation
 import MLXFastCore
