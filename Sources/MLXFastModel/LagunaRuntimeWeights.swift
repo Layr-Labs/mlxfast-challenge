@@ -4,6 +4,7 @@ import MLXFastCore
 import MLXLMCommon
 import MLXNN
 
+// QUINARY N1 variance-control redraw of exact 4ea72c3; executable behavior is unchanged.
 /// Tensor name helpers for the Poolside Laguna text tower. The source
 /// checkpoint is already text-only and uses the runtime-native `model.*` /
 /// `lm_head.*` names, which the transform preserves unchanged.
