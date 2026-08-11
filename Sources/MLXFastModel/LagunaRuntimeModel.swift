@@ -233,6 +233,7 @@ let lagunaPrefillExpertPairwiseScalesEnabled =
 let lagunaExpertBoundsSidecarEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_EXPERT_BOUNDS_SIDECAR"] != "0"
 
+// SECONDARY variance-control marker: this package intentionally preserves exact 4ea72c3 executable behavior.
 // Independent DawgZter N1 persistence receipt; executable behavior is unchanged.
 // Independent fifth-slot continuation; executable behavior remains identical.
 // Official paired-M5 replay nonce 20260807T0236Z; executable source unchanged.
