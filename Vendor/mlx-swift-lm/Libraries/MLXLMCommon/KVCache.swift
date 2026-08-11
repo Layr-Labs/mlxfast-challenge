@@ -416,6 +416,32 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     /// is then an identity-value op.
     private var fusedAppendContiguized = false
 
+    /// True only when the prompt backing was installed by the seed-final
+    /// adoption path, rather than prepared later by an ordinary decode update.
+    public private(set) var seedFinalBackingAdopted = false
+
+    /// Install a capacity-ready prompt backing so the first decode row can use
+    /// the fused append path without the stock growth concat. All validation
+    /// precedes mutation; an admitted call either installs both arrays or traps.
+    public func adoptPrefillBacking(
+        keys: MLXArray, values: MLXArray, count: Int
+    ) -> (MLXArray, MLXArray) {
+        precondition(self.keys == nil && self.values == nil && offset == 0)
+        precondition(count > 0 && keys.ndim == 4 && values.ndim == 4)
+        precondition(keys.dim(0) == values.dim(0) && keys.dim(1) == values.dim(1))
+        precondition(keys.dim(2) == values.dim(2) && keys.dim(2) >= count)
+        precondition(keys.dim(3) == values.dim(3) && keys.dtype == values.dtype)
+        self.keys = keys
+        self.values = values
+        offset = count
+        fusedAppendContiguized = true
+        seedFinalBackingAdopted = true
+        return (
+            keys[.ellipsis, ..<count, 0...],
+            values[.ellipsis, ..<count, 0...]
+        )
+    }
+
     /// Append state for the fused decode attention kernel, or nil when the
     /// backing has no spare row (growth would be required — the stock path
     /// handles that step). `writeIdx` is the slot the stock single-token
@@ -699,6 +725,30 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     /// each step and the slot writes would be lost); the prompt-retained
     /// values array in particular is a transposed view after prefill.
     private var fusedRingContiguized = false
+
+    /// True only when the prompt backing was installed by the seed-final
+    /// adoption path, rather than contiguized by the first ordinary decode.
+    public private(set) var seedFinalBackingAdopted = false
+
+    /// Adopt an already packed, full ring after prompt prefill. The strict
+    /// state/capacity checks keep this unavailable to partial or keep-prefix
+    /// rings and make the first fused decode write immediately legal.
+    public func adoptPrefillBacking(
+        keys: MLXArray, values: MLXArray, count: Int
+    ) -> (MLXArray, MLXArray) {
+        precondition(keep == 0 && self.keys == nil && self.values == nil && offset == 0)
+        precondition(count == maxCacheSize && keys.ndim == 4 && values.ndim == 4)
+        precondition(keys.dim(0) == values.dim(0) && keys.dim(1) == values.dim(1))
+        precondition(keys.dim(2) == count && values.dim(2) == count)
+        precondition(keys.dim(3) == values.dim(3) && keys.dtype == values.dtype)
+        self.keys = keys
+        self.values = values
+        offset = count
+        idx = count
+        fusedRingContiguized = true
+        seedFinalBackingAdopted = true
+        return (keys, values)
+    }
 
     /// Steady-ring state for the fused decode attention kernel, or nil
     /// when the ring is not yet at capacity (shorter prompts, growth

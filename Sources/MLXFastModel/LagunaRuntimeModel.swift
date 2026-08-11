@@ -410,20 +410,6 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineQKVOnlyLayer)
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// output projection. `o_proj` is the single largest BF16 decode weight read
-/// left in the attention block — 30 sliding layers at `[2048, 8192]` plus 10
-/// full-attention layers at `[2048, 6144]` is ~1.2 GB of the decode token's
-/// weight traffic — and unlike Q/K/V it is read *after* SDPA, so quantizing it
-/// changes nothing about the KV dependency or the cache contents.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16 parameter,
-/// which stays authoritative and resident. The first 16 layers are the
-/// acceptance-band-safe first chunk; later submissions can widen the same
-/// layout the way `DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS` was widened.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_OPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock gated projection inside the same binary.
 private let lagunaNativeAffineOProjLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ"] != "0"
     else { return 0 }
@@ -441,28 +427,6 @@ private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineOProjOnlyLayer)
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// per-head gate projection (`g_proj`), admitted to the accepted quantization
-/// envelope by the g_proj amendment. `g_proj` is a tiny `[heads, 2048]` BF16
-/// read (48/64 rows), but its decode GEMV is one extra dispatch per layer
-/// against the same normalized row the Q/K/V batch already computes, and its
-/// output feeds only the softplus gate — never the KV cache — so requantizing
-/// it perturbs the model strictly less than the already-shipped Q/K/V and
-/// o_proj layouts. Unlike those layouts the gate bank is ALWAYS group-32
-/// affine INT8: the envelope caps `g_proj` there, so the NVFP4 tail window
-/// (`lagunaNativeAffineNVFP4From`) and the measurement-only probe format do
-/// not apply to it. On layers whose QKV bank is itself group-32 INT8 the gate
-/// rows concatenate into that same bank and ride the same dispatch for free;
-/// on the NVFP4 tail layers the gate keeps a separate group-32 INT8 bank and
-/// replaces the BF16 GEMV one dispatch for one dispatch.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16
-/// parameter, which stays authoritative and resident. Coverage is prepared
-/// inside `prepareNativeAffineQKVWeight`, so a layer only gets the gate
-/// layout when its QKV layout is also active.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_GPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock BF16 gate projection inside the same binary.
 private let lagunaNativeAffineGProjLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ"] != "0"
     else { return 0 }
@@ -483,10 +447,6 @@ private func lagunaUseNativeAffineGProj(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineGProjOnlyLayer)
 }
 
-/// Builds the gate projection's side layout. Unlike
-/// `lagunaNativeAffineWeight` this NEVER takes the NVFP4 tail window or the
-/// probe round-trip: the accepted envelope admits `g_proj` only as group-32
-/// affine INT8, so the layout is fixed regardless of layer depth.
 private func lagunaNativeAffineGProjWeight(_ weight: MLXArray) -> LagunaNativeAffineWeight? {
     guard weight.dtype == .bfloat16, weight.ndim == 2,
         weight.dim(1).isMultiple(of: 32)
@@ -504,56 +464,65 @@ private func lagunaNativeAffineGProjWeight(_ weight: MLXArray) -> LagunaNativeAf
     )
 }
 
-/// Sliding-layer per-head RMSNorm + plain RoPE fusion (see
-/// `lagunaSlidingQKNormRoPEKernel`).
-///
-/// **DEFAULT ON, deliberately** (`!= "0"`; set
-/// `DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE=0` to ablate).
-///
-/// History, because the negative result and its resolution are the
-/// instructive part — but note the default is ON today:
-///  * Submission `7333473` ranked this fusion at **-0.19%** (1.09995 against
-///    a 1.10187 frontier) and it shipped default-off. The diagnosis at the
-///    time — "one simdgroup per head is a bad kernel shape" — was wrong.
-///  * The actual cause was one redundant line. The kernel parked the inverse
-///    RMS in a `threadgroup` slot and issued a `simdgroup_barrier` to
-///    broadcast it, but `simd_sum` already returns the total to *every* lane,
-///    so each lane can derive the same `precise::rsqrt` locally and
-///    bit-identically. At 72 threadgroups per layer across 30 sliding layers
-///    that barrier was paid **2160 times per decode token** for nothing, and
-///    the full-attention twin had the identical pattern (another 560).
-///  * Deleting both and **re-enabling** this fusion measured 10.456 -> 10.326
-///    ms steady step (+1.19%, 4/4 pairs) and promoted as `9e06de6` at
-///    **1.12019, +1.73%** — the largest single win in the project.
-///
-/// So the -0.19% figure describes a kernel that no longer exists. Do not
-/// spend measurement pairs re-ablating this on the strength of that number.
 let lagunaFusedSlidingQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_QK_NORM_ROPE"] != "0"
 
-/// Multi-token (prefill) twin of the two decode QK-norm+RoPE fusions above
-/// (see `lagunaPrefillSlidingQKNormRoPEKernel` /
-/// `lagunaPrefillFullQKNormYaRNKernel`). One dispatch per layer replaces the
-/// four stock dispatches on sliding layers (q RMSNorm, k RMSNorm, RoPE q,
-/// RoPE k) and the six on full-attention layers (the partial-YaRN RoPE first
-/// materializes a general copy of the transposed view). The cos/sin rows
-/// come from the same load-time probe-seed atlas the decode kernels can
-/// consume, so every rotary factor is a float the stock RoPE kernel itself
-/// produced.
-///
-/// **DEFAULT ON** (`!= "0"`; set `DARKBLOOM_PREFILL_QK_NORM_ROPE=0` to
-/// ablate). Guarded on shape/dtype/family and a host-known cache offset
-/// with `offset + L <= lagunaRoPEAngleAtlasLength`; every other case takes
-/// the verbatim stock path.
 private let lagunaPrefillQKNormRoPEEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_NORM_ROPE"] != "0"
 
-/// Heads-per-threadgroup repartition for the prefill QK-norm+RoPE kernels.
-/// The shipped kernels pack four heads (four SIMDs) per threadgroup; this
-/// selects a one-head-per-threadgroup twin (one SIMD) instead -- the proven
-/// DECODE shape. Bit-exact in the EG256 class: each head is one SIMD and all
-/// per-head arithmetic is SIMD-local, so only threadgroup composition changes.
-/// Default `1` selects H1; `DARKBLOOM_PREFILL_QK_HEADS=4` restores the control.
+/// Official-seed dose: pack the final K/V cache layout in the 29 ordinary
+/// sliding-attention layers. Every full layer and the terminal stay stock.
+private let lagunaSeedFinalKVEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SEED_FINAL_KV"] != "0"
+private let lagunaSeedFinalKVDiagnostics =
+    ProcessInfo.processInfo.environment["DARKBLOOM_SEED_FINAL_KV_DIAGNOSTICS"] == "1"
+
+private func lagunaSeedFinalKVReceipt(_ result: MLXArray, cache: [KVCache]) {
+    guard lagunaSeedFinalKVDiagnostics, let offset = cache.first?.offset,
+        offset == 512 || offset == 513 || offset == 640
+    else { return }
+    precondition(cache.count == LagunaConstants.numHiddenLayers)
+    precondition(cache.allSatisfy { $0.offset == offset })
+    eval(result)
+    var digest: UInt64 = 0xcbf29ce484222325
+    var seedFinalAdopted = 0
+    var fullLayerCount = 0
+    var slidingLayerCount = 0
+    for entry in cache {
+        let state = entry.state
+        precondition(state.count == 2)
+        if let full = entry as? KVCacheSimple {
+            fullLayerCount += 1
+            precondition(!full.seedFinalBackingAdopted)
+        }
+        if let ring = entry as? RotatingKVCache {
+            slidingLayerCount += 1
+            if ring.seedFinalBackingAdopted { seedFinalAdopted += 1 }
+        }
+        for array in state {
+            precondition(array.dtype == .bfloat16)
+            array.asData().data.withUnsafeBytes { bytes in
+                for word in bytes.bindMemory(to: UInt16.self) {
+                    digest ^= UInt64(UInt16(littleEndian: word))
+                    digest &*= 0x100000001b3
+                }
+            }
+        }
+    }
+    let terminalAdopted =
+        (cache.last as? KVCacheSimple)?.seedFinalBackingAdopted
+        ?? (cache.last as? RotatingKVCache)?.seedFinalBackingAdopted
+        ?? false
+    precondition(!terminalAdopted)
+    precondition(fullLayerCount == 10 && slidingLayerCount == 30)
+    let eligibleCount = slidingLayerCount - 1
+    let line = "seed_final_kv_receipt offset=\(offset) lockstep_offsets=40/40 "
+        + "sliding_seed_final_adopted=\(seedFinalAdopted)/\(eligibleCount) "
+        + "full_seed_path=stock terminal_seed_path=stock "
+        + "digest=\(String(digest, radix: 16))\n"
+    FileHandle.standardError.write(Data(line.utf8))
+}
+
 let lagunaPrefillQKHeadsPerGroup: Int = {
     let raw =
         ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_QK_HEADS"]
@@ -2384,6 +2353,47 @@ func lagunaWarmFullFusedAttentionKernel() {
 ///    absolute position — values the stock RoPE kernel computed, not a
 ///    re-derivation. The decode twin (`laguna_sliding_qk_norm_rope_bf16_128_v1`)
 ///    consumes the same table with the same expression.
+private let lagunaSeedFinalKVPackKernel = MLXFast.metalKernel(
+    name: "laguna_seed_final_kv_pack_bf16_v1",
+    inputNames: ["raw_keys", "raw_values", "cache_capacity"],
+    outputNames: ["packed_keys", "packed_values"],
+    source: """
+constexpr uint length = 512;
+constexpr uint heads = 8;
+constexpr uint dim = 128;
+uint i = thread_position_in_grid.x;
+uint d = i % dim;
+uint x = i / dim;
+uint t = x % length;
+uint h = x / length;
+uint capacity = uint(cache_capacity[0]);
+packed_keys[(h * capacity + t) * dim + d] = raw_keys[i];
+packed_values[(h * capacity + t) * dim + d] =
+    raw_values[(t * heads + h) * dim + d];
+""",
+    ensureRowContiguous: true
+)
+
+func lagunaSeedFinalKVPack(
+    keys: MLXArray, rawValues: MLXArray, capacity: Int
+) -> (MLXArray, MLXArray) {
+    let length = 512
+    let heads = LagunaConstants.numKeyValueHeads
+    let dim = LagunaConstants.headDim
+    precondition(capacity == length || capacity == length + 256)
+    precondition(keys.dtype == .bfloat16 && rawValues.dtype == .bfloat16)
+    precondition(keys.dims(1, heads, length, dim))
+    precondition(rawValues.dims(1, length, heads * dim))
+    let outputs = lagunaSeedFinalKVPackKernel(
+        [keys, rawValues, MLXArray([Int32(capacity)])],
+        grid: (heads * length * dim, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[1, heads, capacity, dim], [1, heads, capacity, dim]],
+        outputDTypes: [.bfloat16, .bfloat16]
+    )
+    return (outputs[0], outputs[1])
+}
+
 private let lagunaPrefillSlidingQKNormRoPEKernel = MLXFast.metalKernel(
     name: "laguna_prefill_sliding_qk_norm_rope_bf16_128_v2",
     inputNames: [
@@ -6116,13 +6126,35 @@ final class LagunaRuntimeAttention: Module {
                 kNorm(keys.reshaped(B, L, nKVHeads, headDim))
                 .transposed(0, 2, 1, 3)
         }
+        var seedFinalCache: (keys: MLXArray, values: MLXArray)?
+        if lagunaSeedFinalKVEnabled && isSliding && L == 512 {
+            precondition(
+                B == 1 && qkNormRoPEFused && fusedAttended == nil &&
+                    values.dtype == .bfloat16 &&
+                    values.dims(1, L, nKVHeads * headDim))
+            let capacity = isSliding ? L : L + 256
+            let packed = lagunaSeedFinalKVPack(
+                keys: keys, rawValues: values, capacity: capacity)
+            if isSliding {
+                guard let ring = cache as? RotatingKVCache,
+                    ring.maxSize == L
+                else { preconditionFailure("seed-final K/V requires an empty 512-row ring") }
+                seedFinalCache = ring.adoptPrefillBacking(
+                    keys: packed.0, values: packed.1, count: L)
+            } else {
+                guard let append = cache as? KVCacheSimple, append.step == 256
+                else { preconditionFailure("seed-final K/V requires a step-256 append cache") }
+                seedFinalCache = append.adoptPrefillBacking(
+                    keys: packed.0, values: packed.1, count: L)
+            }
+        }
         // With a singleton sequence axis, `[B, 1, H, D]` and
         // `[B, H, 1, D]` have the same contiguous byte order. Reshape
         // directly so decode does not carry a no-op transpose view through
         // the lazy graph. Multi-token calls still require the real axis swap.
         // A fused attention branch consumed the raw values already, so the
         // head-major layout only exists for the stock SDPA fallback.
-        if fusedAttended == nil {
+        if fusedAttended == nil && seedFinalCache == nil {
             values =
                 L == 1
                 ? values.reshaped(B, nKVHeads, L, headDim)
@@ -6134,16 +6166,24 @@ final class LagunaRuntimeAttention: Module {
             keys = applyRotaryPosition(rope, to: keys, cache: cache)
         }
 
-        let attended =
-            fusedAttended
-            ?? attentionWithCacheUpdate(
+        let attended: MLXArray
+        if let seedFinalCache {
+            attended = MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: seedFinalCache.keys,
+                values: seedFinalCache.values,
+                scale: scale,
+                mask: mask
+            )
+        } else {
+            attended = fusedAttended ?? attentionWithCacheUpdate(
                 queries: queries,
                 keys: keys,
                 values: values,
                 cache: cache,
                 scale: scale,
-                mask: mask
-            )
+                mask: mask)
+        }
         // SDPA returns `[B, H, L, D]`. When `L == 1`, flattening its
         // contiguous head-major payload directly produces the exact
         // `[B, 1, H*D]` byte order; the transpose only changes singleton-axis
@@ -11678,6 +11718,7 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
         if case .logits = lagunaDecodeAsyncStage, inputs.dims(1, 1) {
             asyncEval(result)
         }
+        if let cache { lagunaSeedFinalKVReceipt(result, cache: cache) }
         return result
     }
 
