@@ -460,9 +460,9 @@ MTL::ComputePipelineState* get_reduce_kernel(
     const Dtype& in_type,
     const Dtype& out_type,
     const std::string& idx_t,
-    int ndim /* = -1 */,
-    int bm /* = -1 */,
-    int bn /* = -1 */) {
+    int ndim ,
+    int bm ,
+    int bn ) {
   auto lib = d.get_library(kernel_name, [&]() {
     std::string op_type = op_name;
     op_type[0] = std::toupper(op_name[0]);
@@ -716,8 +716,6 @@ MTL::ComputePipelineState* get_gemv_kernel(
     bool axpby) {
   const auto& lib_name = kernel_name;
   auto lib = d.get_library(lib_name, [&]() {
-    // The aligned non-transposed variant is a distinct kernel template
-    // ("gemv_al"); the host encodes it in the kernel name prefix.
     bool aligned = kernel_name.compare(0, 8, "gemv_al_") == 0;
     std::ostringstream kernel_source;
     kernel_source << metal::gemv()
@@ -1116,33 +1114,14 @@ MTL::ComputePipelineState* get_steel_gemm_segmented_nax_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
-// Defined in quantized.cpp; parses DARKBLOOM_GATHER_XMAJOR once per process.
 int darkbloom_gather_xmajor_ct();
 
-// Defined in quantized.cpp; parses DARKBLOOM_SWIGLU_REGLOCAL once per
-// process.
 bool darkbloom_swiglu_reglocal();
 
 bool darkbloom_bsearch_hoist();
 
 namespace {
 
-// DARKBLOOM_STAGE2_GATHER: double-buffered (stage-2) weight staging in the
-// expert-aligned prefill gather-QMM (fp_gather_qmm_rhs_expert_nax). Injected
-// as a source-level #define at JIT assembly time, exactly like the
-// DARKBLOOM_ATTN_* levers below: resolved once per process, never part of a
-// pipeline specialization key, so exactly one variant is ever compiled per
-// run and A/B arms are separate runs of the same binary with the env var
-// flipped. Default OFF: unset compiles byte-identical stock staging (the
-// guarded blocks preprocess away). Injection is gated on the expert kernel
-// name so every other fp_quantized_nax JIT source stays byte-identical in
-// both arms.
-//
-// The stderr line is the ground-truth trace the STAGE_* levers lacked: those
-// function constants only ever reached the NON-expert fp_gather_qmm_rhs_nax,
-// so flipping them measured their own control. This one fires from the
-// expert kernel's own JIT assembly, so "active" means the dispatched
-// pipeline was built from the stage-2 source.
 const char* darkbloom_stage2_gather_define() {
   static const char* define = [] {
     const bool v = env::get_var("DARKBLOOM_STAGE2_GATHER", "") == "1";
@@ -1157,15 +1136,6 @@ const char* darkbloom_stage2_gather_define() {
   return define;
 }
 
-// DARKBLOOM_GATHER_XMAJOR: fold adjacent column tiles of the expert-aligned
-// prefill gather-QMM into one threadgroup so the expert run's x fragments
-// are loaded once per k-tile instead of once per column tile (x DRAM
-// traffic divides by the fold). Injected exactly like the stage2 define
-// above: resolved once per process, gated on the expert kernel name, never
-// part of a pipeline specialization key; A/B arms are separate runs. The
-// fold value comes from darkbloom_gather_xmajor_ct() (quantized.cpp), the
-// SAME function the dispatch site uses to divide grid.x, so the compiled
-// kernel and the launch geometry cannot disagree.
 const char* darkbloom_gather_xmajor_define() {
   static const std::string define = [] {
     const int ct = darkbloom_gather_xmajor_ct();
@@ -1184,14 +1154,6 @@ const char* darkbloom_gather_xmajor_define() {
   return define.c_str();
 }
 
-// DARKBLOOM_SWIGLU_REGLOCAL: register-local swiglu epilogue in the
-// expert-aligned gather-QMM. Injected exactly like the levers above:
-// resolved once per process, gated on the expert kernel name, never part
-// of a pipeline specialization key. Default ON -- unset injects the define
-// and the kernel's own geometry guard (WN==1, BN==64, SM==16) picks the
-// register-local path only for the shipped variant-5 tiling; "0" compiles
-// the stock threadgroup-staged epilogue (the guarded blocks preprocess
-// away, byte-identical stock source).
 const char* darkbloom_swiglu_reglocal_define() {
   static const char* define = [] {
     const bool v = darkbloom_swiglu_reglocal();
@@ -1222,7 +1184,7 @@ const char* darkbloom_bsearch_hoist_define() {
   return define;
 }
 
-} // namespace
+}
 
 MTL::ComputePipelineState* get_qmm_nax_kernel(
     metal::Device& d,
@@ -1340,46 +1302,9 @@ MTL::ComputePipelineState* get_steel_attention_kernel(
 
 namespace {
 
-// DARKBLOOM_ATTN_QHOIST: hoist the loop-invariant Q fragments out of the
-// steel-attention K-block loop.
-//
-// The kb loop in attention_nax advances K and V but never Q, yet the QK^T
-// phase re-executed `Qtile.load(...)` on every iteration, re-reading the same
-// TQ*TD fragments from device memory. At the frozen 512-token prefill window
-// (BQ=64 BK=32 BD=128 WM=4 WN=1 => TQ=1 TD=8 TK=2, kb_lim averaging 9.00) that
-// is 8 of every 40 device fragment-loads per simdgroup per iteration, ~17.8%
-// of the loader traffic, and it drops the LSU:MMA issue ratio from 5.00 to
-// 4.11. See notes/21-attn-analysis.md.
-//
-// DEFAULT OFF, read as `== "1"`. This is an unmeasured arm: the hoist extends
-// 8 fragments' live range across the whole loop (+28 registers/thread), and if
-// that crosses an occupancy threshold it shows up as a regression, not a win.
-// It must not ship until a paired measurement says otherwise.
-//
-// WHY A #define AND NOT A FUNCTION CONSTANT. The natural home for a host-side
-// switch is scaled_dot_product_attention.cpp, but that file is not in
-// benchmark.json editablePaths, so it cannot carry one. jit_kernels.cpp is
-// editable and is where the JIT source string is assembled, which turns out to
-// be the better place anyway: a define is baked into the source text before
-// compilation and therefore CANNOT enter the Metal pipeline specialization
-// key. A function constant can, and flipping one mid-process forces a second
-// pipeline compile that can land inside a timed forward -- the exact trap that
-// produced a reproducible 15-24% regression for
-// DARKBLOOM_PREFILL_GATHER_RUNSKIP (see the note in quantized.cpp).
-//
-// Resolved once via a function-local static, so the value is constant for the
-// process. Device::get_library caches the built library in memory keyed on
-// lib_name with no on-disk persistence, so exactly one variant is ever
-// compiled and a fresh process picks up a changed environment cleanly.
-//
-// Returns a `const char*` rather than a std::string because concatenate()
-// takes its arguments by value; the empty string appends nothing.
 const char* darkbloom_attn_qhoist_define() {
   static const bool enabled = [] {
     const bool v = env::get_var("DARKBLOOM_ATTN_QHOIST", "") == "1";
-    // Same ground-truth discipline the STAGE arms needed: prove the arm is
-    // live before trusting its number. A #define that silently fails to reach
-    // the source string produces an arm that measures its own control.
     if (env::get_var("DARKBLOOM_ATTN_TRACE", "") == "1") {
       fprintf(stderr, "mlxfast: attn qhoist: enabled=%d\n", int(v));
     }
@@ -1388,16 +1313,6 @@ const char* darkbloom_attn_qhoist_define() {
   return enabled ? "\n#define DARKBLOOM_ATTN_QHOIST 1\n" : "";
 }
 
-// DARKBLOOM_ATTN_QBLOCK_MAJOR: present the existing (query-block, query-head)
-// workgroups to the GPU in query-block-major order. The Metal dispatch remains
-// the stock (NQ, H, B) grid; the kernel applies a bijection from its physical
-// x-fast linear index to the original logical coordinates. No threadgroup's
-// arithmetic or output ownership changes.
-//
-// This standalone candidate is default ON. As with QHOIST, bake the choice
-// into the one JIT source compiled by a process rather than introducing a
-// pipeline function constant and a second timed compilation. An explicit
-// DARKBLOOM_ATTN_QBLOCK_MAJOR=0 prepends the only override.
 const char* darkbloom_attn_qblock_major_define() {
   static const bool enabled = [] {
     const bool v =
@@ -1411,9 +1326,6 @@ const char* darkbloom_attn_qblock_major_define() {
   return enabled ? "" : "\n#define DARKBLOOM_ATTN_QBLOCK_MAJOR 0\n";
 }
 
-// DARKBLOOM_ATTN_QBLOCK_ZIGZAG: keep the qblock-major head locality above,
-// but alternate high- and low-work causal query blocks. Default ON for this
-// standalone alternative; an explicit 0 recovers ascending qblock-major.
 const char* darkbloom_attn_qblock_zigzag_define() {
   static const bool enabled = [] {
     const bool v =
@@ -1427,7 +1339,7 @@ const char* darkbloom_attn_qblock_zigzag_define() {
   return enabled ? "" : "\n#define DARKBLOOM_ATTN_QBLOCK_ZIGZAG 0\n";
 }
 
-} // namespace
+}
 
 MTL::ComputePipelineState* get_steel_attention_nax_kernel(
     metal::Device& d,
@@ -1466,4 +1378,4 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
 }
 
-} // namespace mlx::core
+}

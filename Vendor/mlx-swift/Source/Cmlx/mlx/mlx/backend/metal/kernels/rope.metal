@@ -30,12 +30,10 @@ void rope_single_impl(
   float angle_scale = allow_mscale && scale < 0.0f ? 1.0f : scale;
   float L = angle_scale * static_cast<float>(offset);
 
-  // Compute costheta, sintheta
   float theta = L * inv_freq;
   float costheta = metal::fast::cos(theta);
   float sintheta = metal::fast::sin(theta);
 
-  // Compute the input and output indices
   uint index_1, index_2;
   if (traditional) {
     index_1 = 2 * pos.x + pos.y * stride;
@@ -45,7 +43,6 @@ void rope_single_impl(
     index_2 = index_1 + grid.x;
   }
 
-  // Read and write the output
   float x1 = rope_input_with_mscale<T, allow_mscale>(in[index_1], scale);
   float x2 = rope_input_with_mscale<T, allow_mscale>(in[index_2], scale);
   float rx1;
@@ -114,11 +111,9 @@ void rope_impl(
   float L = angle_scale * static_cast<float>(pos.y + batch_offset);
   auto mat_idx = batch_idx * n_head + head_idx;
 
-  // Compute costheta, sintheta
   float theta = L * inv_freq;
   float costheta = metal::fast::cos(theta);
   float sintheta = metal::fast::sin(theta);
-  // Compute the input and output indices
   IdxT in_index_1;
   if (hs_transpose) {
     IdxT batch_stride = grid.y * IdxT(strides[1]);
@@ -143,7 +138,6 @@ void rope_impl(
     in_index_2 = in_index_1 + grid.x * IdxT(strides[2]);
   }
   for (int i = 0; i < N && head_idx + i < n_head; ++i) {
-    // Read and write the output
     float x1 =
         rope_input_with_mscale<T, allow_mscale>(in[in_index_1], scale);
     float x2 =
