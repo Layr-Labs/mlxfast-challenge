@@ -1978,9 +1978,72 @@ template <
       const short sgp_sm =
           min(int(SM), max(0, int(chunk_rows) - int(tm)));
       const bool sg_active = sgp_sm > 0;
+#ifdef DARKBLOOM_MIXED_M8_TAIL
+      // Unlike the retired total-run<=8 experiment, this selects the final
+      // 1..8-row residual of any BM64 chunk (notably 17..24 routed rows).
+      // Full 16-row bands remain on the promoted cooperative-fragment path.
+      constexpr int kMixedM8 = 8;
+      constexpr bool kMixedM8Geometry =
+          BM == 64 && WM == 4 && WN == 1 && BN == 64;
+      const short mixed_m8_tail_rows = short(chunk_rows & 15);
+      const short mixed_m8_tail_start = short(chunk_rows - mixed_m8_tail_rows);
+      const bool has_mixed_m8_tail =
+          kMixedM8Geometry && mixed_m8_tail_rows > 0 &&
+          mixed_m8_tail_rows <= kMixedM8 &&
+          chunk_start + mixed_m8_tail_start + kMixedM8 <= M;
+      const bool mixed_m8_tail_sg =
+          has_mixed_m8_tail && sg_active && tm == mixed_m8_tail_start;
+      const bool normal_sg_active = sg_active && !mixed_m8_tail_sg;
+#else
+      const bool normal_sg_active = sg_active;
+#endif
 
       NAXTile<float, TM, TN> Dtile;
       Dtile.clear();
+
+#ifdef DARKBLOOM_MIXED_M8_TAIL
+      constexpr int kMixedTileN8 = 32;
+      constexpr int kMixedK8 = 16;
+      constexpr auto mixed_m8_desc = mpp::tensor_ops::matmul2d_descriptor(
+          kMixedM8,
+          kMixedTileN8,
+          kMixedK8,
+          false,
+          true,
+          true,
+          mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+      mpp::tensor_ops::matmul2d<
+          mixed_m8_desc, metal::execution_simdgroup> mixed_m8_op;
+      const device T* mixed_m8_x =
+          x + size_t(chunk_start + mixed_m8_tail_start) * kernel_K;
+      auto mixed_m8_a0 = tensor(
+          const_cast<device T*>(mixed_m8_x),
+          extents<int, kMixedK8, kMixedM8>(),
+          array<int, 2>{1, kernel_K});
+      auto mixed_m8_b0 = tensor(
+          Ws,
+          extents<int, kMixedK8, kMixedTileN8>(),
+          array<int, 2>{1, BK_padded});
+      auto mixed_m8_b1 = tensor(
+          Ws + kMixedTileN8 * BK_padded,
+          extents<int, kMixedK8, kMixedTileN8>(),
+          array<int, 2>{1, BK_padded});
+      auto mixed_m8_c0 =
+          mixed_m8_op.template get_destination_cooperative_tensor<
+              decltype(mixed_m8_a0), decltype(mixed_m8_b0), float>();
+      auto mixed_m8_c1 =
+          mixed_m8_op.template get_destination_cooperative_tensor<
+              decltype(mixed_m8_a0), decltype(mixed_m8_b1), float>();
+      if (mixed_m8_tail_sg) {
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < mixed_m8_c0.get_capacity(); ++i) {
+          if (mixed_m8_c0.is_valid_element(i)) {
+            mixed_m8_c0[i] = 0.0f;
+            mixed_m8_c1[i] = 0.0f;
+          }
+        }
+      }
+#endif
 
       const device T* xn =
           x + size_t(chunk_start + tm) * kernel_K;
@@ -2027,7 +2090,7 @@ template <
         // identical while the row predicate hoists out of the contiguous
         // four-element runs and the Int<1> contiguous branch is restored.
         NAXTile<T, TM, TK> Atile[BK / SK];
-        if (sg_active) {
+        if (normal_sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             if (sgp_sm == SM) {
@@ -2056,7 +2119,7 @@ template <
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sg_active) {
+        if (normal_sg_active) {
           STEEL_PRAGMA_UNROLL
           for (int kk1 = 0; kk1 < BK; kk1 += SK) {
             NAXTile<Wtype, TN, TK> Btile;
@@ -2076,9 +2139,83 @@ template <
           }
         }
 
+#ifdef DARKBLOOM_MIXED_M8_TAIL
+        if (mixed_m8_tail_sg) {
+          STEEL_PRAGMA_UNROLL
+          for (int kk1 = 0; kk1 < BK; kk1 += kMixedK8) {
+            auto mixed_m8_a = tensor(
+                const_cast<device T*>(mixed_m8_x + k * BK + kk1),
+                extents<int, kMixedK8, kMixedM8>(),
+                array<int, 2>{1, kernel_K});
+            auto mixed_m8_b = tensor(
+                Ws + kk1,
+                extents<int, kMixedK8, kMixedTileN8>(),
+                array<int, 2>{1, BK_padded});
+            auto mixed_m8_b_hi = tensor(
+                Ws + kMixedTileN8 * BK_padded + kk1,
+                extents<int, kMixedK8, kMixedTileN8>(),
+                array<int, 2>{1, BK_padded});
+            mixed_m8_op.run(mixed_m8_a, mixed_m8_b, mixed_m8_c0);
+            mixed_m8_op.run(mixed_m8_a, mixed_m8_b_hi, mixed_m8_c1);
+          }
+        }
+#endif
+
         xn += BK;
         loader_w.next();
       }
+
+#ifdef DARKBLOOM_MIXED_M8_TAIL
+      if (mixed_m8_tail_sg) {
+        // MPP exposes the implementation-defined cooperative-register layout
+        // through per-element coordinates. Store only logical residual rows
+        // directly from those registers: no 2 KiB threadgroup accumulator,
+        // post-matmul barrier, or 128-thread scatter is required.
+        const int mixed_row0 = chunk_start + mixed_m8_tail_start;
+        const bool mixed_fuse_swiglu = kernel_N == 1024 && kernel_K == 2048;
+        if (mixed_fuse_swiglu) {
+#pragma clang fp contract(off)
+          constexpr int activated_cols = BN / 2;
+#pragma clang loop unroll(full)
+          for (uint16_t i = 0; i < mixed_m8_c0.get_capacity(); ++i) {
+            if (mixed_m8_c0.is_valid_element(i)) {
+              const auto coord =
+                  mixed_m8_c0.get_multidimensional_index(i);
+              const int col = int(coord[0]);
+              const int row = int(coord[1]);
+              if (row < int(mixed_m8_tail_rows)) {
+                const bfloat gate = bfloat(mixed_m8_c0[i]);
+                const bfloat up = bfloat(mixed_m8_c1[i]);
+                const bfloat exp_abs = metal::exp(metal::abs(gate));
+                const bfloat denominator = bfloat(1) + exp_abs;
+                const bfloat z = bfloat(1) / denominator;
+                const bfloat sigmoid =
+                    gate < bfloat(0) ? z : bfloat(1) - z;
+                const bfloat silu = bfloat(gate * sigmoid);
+                y[size_t(mixed_row0 + row) * (kernel_N / 2) +
+                  size_t(tid.x) * activated_cols + col] = bfloat(silu * up);
+              }
+            }
+          }
+        } else {
+#pragma clang loop unroll(full)
+          for (uint16_t i = 0; i < mixed_m8_c0.get_capacity(); ++i) {
+            if (mixed_m8_c0.is_valid_element(i)) {
+              const auto coord =
+                  mixed_m8_c0.get_multidimensional_index(i);
+              const int col = int(coord[0]);
+              const int row = int(coord[1]);
+              if (row < int(mixed_m8_tail_rows)) {
+                const size_t out =
+                    size_t(mixed_row0 + row) * kernel_N + y_col + col;
+                y[out] = static_cast<T>(mixed_m8_c0[i]);
+                y[out + kMixedTileN8] = static_cast<T>(mixed_m8_c1[i]);
+              }
+            }
+          }
+        }
+      }
+#endif
 
 #ifndef DARKBLOOM_SWIGLU_REGLOCAL
       // Staged-epilogue arm only: reg-local epilogues read no threadgroup
@@ -2128,12 +2265,12 @@ template <
         }
         if constexpr (!kSwigluRegLocal) {
 #endif // DARKBLOOM_SWIGLU_REGLOCAL
-        if (sg_active) {
+        if (normal_sg_active) {
           Dtile.template store<bfloat, BN, 1>(
               gate_up_stage + tm * BN + tn);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg_active && (simd_group_id % WN) == 0) {
+        if (normal_sg_active && (simd_group_id % WN) == 0) {
           constexpr int activated_cols = BN / 2;
           for (int linear = simd_lane_id;
                linear < int(sgp_sm) * activated_cols;
@@ -2159,7 +2296,7 @@ template <
 #ifdef DARKBLOOM_SWIGLU_REGLOCAL
         }
 #endif // DARKBLOOM_SWIGLU_REGLOCAL
-      } else if (sg_active) {
+      } else if (normal_sg_active) {
         device T* yn =
             y + size_t(chunk_start + tm) * kernel_N + y_col + tn;
         if (sgp_sm == SM) {

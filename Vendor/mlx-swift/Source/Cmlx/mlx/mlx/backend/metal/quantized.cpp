@@ -1588,6 +1588,14 @@ bool darkbloom_bsearch_hoist() {
   return v;
 }
 
+// Mixed-fragment expert prefill path. The validated direct-store rung is ON by
+// default; setting DARKBLOOM_MIXED_M8_TAIL=0 restores the promoted M16 path.
+bool darkbloom_mixed_m8_tail() {
+  static const bool v =
+      env::get_var("DARKBLOOM_MIXED_M8_TAIL", "1") != "0";
+  return v;
+}
+
 // Exact storage markers installed only by Laguna's certified zero-copy expert
 // scale views. Layout 1 is the fused gate/up walk-order bank; layout 2 is the
 // row-major routed down bank. Keep this classifier at the outer GatherQMM
@@ -1881,7 +1889,8 @@ void gather_qmm_rhs_nax(
           ? ("_eg_" + std::to_string(egroups) + (expert_widest ? "_ws_1" : "_ws_0") +
              (expert_wideld ? "_wl_1" : "_wl_0") +
              "_ps_" + std::to_string(expert_pairwise_scale_layout) +
-             (expert_bounds_sidecar ? "_eb_1" : "_eb_0"))
+             (expert_bounds_sidecar ? "_eb_1" : "_eb_0") +
+             (darkbloom_mixed_m8_tail() ? "_mx8_1" : "_mx8_0"))
           : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
@@ -2068,7 +2077,9 @@ void gather_qmm_rhs(
     metal::Device& d,
     const Stream& s,
     const std::string mode) {
-  if (metal::is_nax_available() && transpose &&
+  const bool local_force_expert_nax =
+      env::get_var("DARKBLOOM_LOCAL_FORCE_EXPERT_NAX", "") == "1";
+  if ((metal::is_nax_available() || local_force_expert_nax) && transpose &&
       (env::enable_tf32() || x_.dtype() != float32)) {
     return gather_qmm_rhs_nax(
         /* const array& x_ = */ x_,

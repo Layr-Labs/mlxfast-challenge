@@ -1125,6 +1125,8 @@ bool darkbloom_swiglu_reglocal();
 
 bool darkbloom_bsearch_hoist();
 
+bool darkbloom_mixed_m8_tail();
+
 namespace {
 
 // DARKBLOOM_STAGE2_GATHER: double-buffered (stage-2) weight staging in the
@@ -1242,6 +1244,21 @@ std::string darkbloom_expert_bounds_sidecar_define(
       : std::string();
 }
 
+const char* darkbloom_mixed_m8_tail_define() {
+  static const char* define = [] {
+    const bool v = darkbloom_mixed_m8_tail();
+    if (v || env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
+      fprintf(
+          stderr,
+          "mlxfast: fusion %s: mixed_m8_tail "
+          "(expert gather-QMM JIT source)\n",
+          v ? "active" : "inactive");
+    }
+    return v ? "\n#define DARKBLOOM_MIXED_M8_TAIL 1\n" : "";
+  }();
+  return define;
+}
+
 } // namespace
 
 MTL::ComputePipelineState* get_qmm_nax_kernel(
@@ -1269,6 +1286,9 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
             : "",
         (kernel_name.find("_expert_") != std::string::npos)
             ? darkbloom_expert_bounds_sidecar_define(kernel_name)
+            : "",
+        (kernel_name.find("_expert_") != std::string::npos)
+            ? darkbloom_mixed_m8_tail_define()
             : "",
         metal::gemm_nax(),
         metal::quantized_utils(),
