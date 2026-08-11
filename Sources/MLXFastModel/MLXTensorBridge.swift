@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXFastCore
 
+// DawgZter primary variance control: execution remains exact promoted 4ea N1.
 public protocol MLXTensorBridge {
     associatedtype Array
 
