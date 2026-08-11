@@ -1737,9 +1737,10 @@ template <
   threadgroup Wtype* Ws = (threadgroup Wtype*)Ws_storage;
   threadgroup bfloat* gate_up_stage =
       (threadgroup bfloat*)Ws_storage;
-#ifdef DARKBLOOM_BSEARCH_HOIST
+#if defined(DARKBLOOM_BSEARCH_HOIST) && \
+    !defined(DARKBLOOM_EXPERT_BOUNDS_SIDECAR)
   threadgroup int bounds[experts / expert_groups + 1];
-#else
+#elif !defined(DARKBLOOM_EXPERT_BOUNDS_SIDECAR)
   threadgroup int bounds[2];
 #endif
 
@@ -1782,7 +1783,8 @@ template <
       (WN == 1) && (BN == 64) && ((BM / WM) == 16);
 #endif // DARKBLOOM_SWIGLU_REGLOCAL
 
-#ifdef DARKBLOOM_BSEARCH_HOIST
+#if defined(DARKBLOOM_BSEARCH_HOIST) && \
+    !defined(DARKBLOOM_EXPERT_BOUNDS_SIDECAR)
   // Hoist: all slot bounds once, one lower_bound per thread (same integers
   // as the per-slot lid==0 searches), one barrier instead of two per slot.
   for (int b = int(lid); b <= experts / expert_groups;
@@ -1803,7 +1805,17 @@ template <
         static_cast<uint32_t>(
             tid.y * (experts / expert_groups) + expert_slot);
 
-#ifdef DARKBLOOM_BSEARCH_HOIST
+#ifdef DARKBLOOM_EXPERT_BOUNDS_SIDECAR
+    // N1b: the sorter already published exact global prefixes at logical
+    // indices [0, 256]. One lane in every simdgroup loads the same pair and
+    // broadcasts it locally. This removes both binary searches, the
+    // threadgroup bounds allocation, and its synchronization while ensuring
+    // every simdgroup begins with identical endpoints.
+    int run_start = simd_lane_id == 0 ? int(indices[expert]) : 0;
+    int run_end = simd_lane_id == 0 ? int(indices[expert + 1]) : 0;
+    run_start = simd_broadcast(run_start, 0);
+    run_end = simd_broadcast(run_end, 0);
+#elif defined(DARKBLOOM_BSEARCH_HOIST)
     const int run_start = bounds[expert_slot];
     const int run_end = bounds[expert_slot + 1];
 #else

@@ -227,6 +227,12 @@ let lagunaPrefillFusedRoutedGateUpEnabled =
 let lagunaPrefillExpertPairwiseScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_PAIRWISE_SCALES"] != "0"
 
+/// Producer-supplied exact expert prefixes for the two fused sorted routed
+/// prefill QMMs. The sorter and consumer identities encode the selected arm;
+/// zero restores the ordinary sorted-key payload exactly.
+let lagunaExpertBoundsSidecarEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_EXPERT_BOUNDS_SIDECAR"] != "0"
+
 // Official paired-M5 replay nonce 20260807T0236Z; executable source unchanged.
 let lagunaPrefillExpertDownPairwiseScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_DOWN_PAIRWISE_SCALES"] != "0"
@@ -10404,7 +10410,21 @@ private func lagunaFusedSortedRoutedGateUp(
     // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
     //
     if doSort {
-        (sortedX, idx, inverseOrder) = gatherSort(x: sortedX, indices: indices)
+        // N1: only this dedicated fused routed-prefill chain requests the
+        // exact 257-entry expert-bounds payload. The same zero-stride-marked idx
+        // view flows unchanged through both fused gate/up and down QMMs.
+        // `=0` is the exact control and restores ordinary sorted keys.
+        (sortedX, idx, inverseOrder) = gatherSort(
+            x: sortedX,
+            indices: indices,
+            expertBoundsSidecar: lagunaExpertBoundsSidecarEnabled
+                && lagunaExpertAlignedGatherEnabled
+                && pairwiseScales != nil
+                && downWeight != nil
+                && downPairwiseScales != nil
+                && lagunaPrefillExpertPairwiseScalesAdmitted(
+                    routedRows: indices.size)
+        )
     }
     // Fused counterpart of SwitchGLU's separate-bank branch:
     //   xUp = upProj(x, idx, sortedIndices: doSort)
