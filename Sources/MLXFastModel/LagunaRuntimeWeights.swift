@@ -523,6 +523,10 @@ public final class LagunaRuntimeWeightCache {
         {
             lagunaWarmFullFusedAttentionKernel()
         }
+        // Ordinary attention warmup covers full PC0 only; compile sliding PC1/PC2 explicitly.
+        if lagunaAttentionParamsRoPESidecarEnabled {
+            lagunaWarmAttentionParamsRoPESidecarKernels(model)
+        }
         // Warm the greedy-token pipeline too. Every scored worker request ends
         // in `LagunaCorrectness.greedyToken` (reshape -> last row -> argMax),
         // and the forwards above never run an argmax, so its first use

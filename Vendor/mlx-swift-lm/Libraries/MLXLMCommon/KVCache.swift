@@ -700,6 +700,20 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     /// values array in particular is a transposed view after prefill.
     private var fusedRingContiguized = false
 
+    /// Read-only twin of `fusedRingPrepare`; never contiguizes or mutates.
+    public func fusedRingDescriptor() -> (writeIdx: Int, count: Int, capacity: Int)? {
+        guard keep == 0, let currentKeys = keys, let currentValues = values,
+            currentKeys.dim(2) == maxCacheSize,
+            currentValues.dim(2) == maxCacheSize,
+            offset >= maxCacheSize
+        else { return nil }
+        return (
+            idx == maxCacheSize ? keep : idx,
+            maxCacheSize,
+            maxCacheSize
+        )
+    }
+
     /// Steady-ring state for the fused decode attention kernel, or nil
     /// when the ring is not yet at capacity (shorter prompts, growth
     /// phase) or a `keep` prefix is configured. `writeIdx` is the slot the
