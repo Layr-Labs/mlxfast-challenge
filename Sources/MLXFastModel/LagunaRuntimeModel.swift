@@ -1836,6 +1836,36 @@ private var lagunaRingIdxAtlas: [MLXArray] { LagunaRingIdxAtlasStore.entries }
 let lagunaParamsAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PARAMS_ATLAS"] != "0"
 
+/// Full-attention twin of the ring-index atlas above: pre-materialized
+/// 12-byte params buffers `[writeIdx, writeIdx + 1, capacity]` for every
+/// (capacity rung, write index) pair the `KVCacheSimple` growth policy can
+/// produce (capacity walks multiples of the 256-row step; a write index
+/// only coexists with the rung that holds its final 256-row window), 4096
+/// entries total. Replaces a fresh 3-element MLXArray allocation per
+/// full-attention call (10/step). Input-independent: all entries are built
+/// unconditionally at warmup; the lookup indexes by request-local cache
+/// state, the same contract as the sliding atlas. Any geometry outside the
+/// table (trimmed cache, capacity past the RoPE atlas) falls back to the
+/// per-call allocation with identical bytes.
+private enum LagunaFullParamsAtlasStore {
+    nonisolated(unsafe) static let rungs: [[MLXArray]] = {
+        (1...(lagunaRoPEAngleAtlasLength / 256)).map { n in
+            let capacity = n * 256
+            let entries = (capacity - 256..<capacity).map {
+                MLXArray([UInt32($0), UInt32($0 + 1), UInt32(capacity)])
+            }
+            for entry in entries { eval(entry) }
+            return entries
+        }
+    }()
+}
+
+/// Default-on same-binary ablation selector. Set
+/// `DARKBLOOM_FULL_PARAMS_ATLAS=0` to restore the per-call fresh 3-element
+/// array; every other value reuses the pre-materialized buffers.
+let lagunaFullParamsAtlasEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_FULL_PARAMS_ATLAS"] != "0"
+
 /// `DARKBLOOM_FUSED_FULL_ATTN` (default on; set "0" to disable): decode
 /// fused attention for the ten full-attention layers once the cache backing
 /// has spare capacity (from the second decode step on; the first step's
@@ -2261,6 +2291,25 @@ if (lane == 0) {
     ensureRowContiguous: true
 )
 
+/// Authoritative params-buffer selector for the production full-attention
+/// dispatch. Keeping the selector independently callable lets the model-free
+/// exactness oracle exercise the same lookup/fallback code as the hot path.
+@inline(__always)
+func lagunaFullFusedAttentionParams(writeIdx: Int, capacity: Int) -> MLXArray {
+    precondition(capacity > 0 && writeIdx >= 0 && writeIdx < capacity)
+    if lagunaFullParamsAtlasEnabled, capacity % 256 == 0,
+        capacity <= lagunaRoPEAngleAtlasLength, writeIdx >= capacity - 256
+    {
+        lagunaTrace("full fused attention params atlas")
+        return LagunaFullParamsAtlasStore
+            .rungs[capacity / 256 - 1][writeIdx - (capacity - 256)]
+    }
+    lagunaTrace("full fused attention")
+    return MLXArray([
+        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+    ])
+}
+
 /// Fused decode attention for a full-attention layer with spare backing
 /// capacity. Returns `[1, heads, 1, headDim]`; the caller advances the
 /// cache clock via `KVCacheSimple.fusedAppendAdvance()`.
@@ -2297,10 +2346,8 @@ func lagunaFullFusedAttention(
     precondition(writeIdx >= 0 && writeIdx < capacity)
     precondition(scale.dtype == .float32 && scale.size == 1)
 
-    lagunaTrace("full fused attention")
-    let params = MLXArray([
-        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
-    ])
+    let params = lagunaFullFusedAttentionParams(
+        writeIdx: writeIdx, capacity: capacity)
     return lagunaFullFusedAttentionKernel(
         [
             rawQueries, rawKeys, rawValues,
@@ -2319,6 +2366,12 @@ func lagunaFullFusedAttention(
 /// deterministic, input-independent, evaluated once, and released before the
 /// constructor clears transient allocator cache and wires resident weights.
 func lagunaWarmFullFusedAttentionKernel() {
+    if lagunaFullParamsAtlasEnabled {
+        // Build the params atlas here, before the first scored forward; the
+        // warmup call below uses a 2-row cache and therefore takes the
+        // fallback allocation path.
+        _ = LagunaFullParamsAtlasStore.rungs
+    }
     let headDim = LagunaConstants.headDim
     let heads = LagunaConstants.fullAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
