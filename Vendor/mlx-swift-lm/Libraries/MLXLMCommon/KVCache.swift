@@ -416,6 +416,15 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     /// is then an identity-value op.
     private var fusedAppendContiguized = false
 
+    /// Read-only twin of `fusedAppendPrepare`; never contiguizes or mutates.
+    public func fusedAppendDescriptor() -> (writeIdx: Int, count: Int, capacity: Int)? {
+        guard let currentKeys = keys, let currentValues = values,
+            offset + 1 <= currentKeys.dim(2),
+            currentValues.dim(2) == currentKeys.dim(2)
+        else { return nil }
+        return (offset, offset + 1, currentKeys.dim(2))
+    }
+
     /// Append state for the fused decode attention kernel, or nil when the
     /// backing has no spare row (growth would be required — the stock path
     /// handles that step). `writeIdx` is the slot the stock single-token
