@@ -399,7 +399,6 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
     int wn,
     const array& m);
 
-// Create a GPU kernel template definition for JIT compilation
 template <typename... Args>
 std::string get_template_definition(
     std::string_view name,
@@ -423,4 +422,4 @@ std::string get_template_definition(
       s.str());
 }
 
-} // namespace mlx::core
+}

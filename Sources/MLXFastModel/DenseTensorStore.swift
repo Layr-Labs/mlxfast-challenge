@@ -1,3 +1,11 @@
+// receipt-nonce: maple-advisor-r117-01
+// Comment-only nonce so this submission archive hashes differently from the
+// preceding maple HEAD-class receipts. Zero declarations, zero code paths,
+// zero effect on emitted tokens or timing. Purpose: one draw of the SAME
+// executable class, fired by the advisor to keep the single official slot
+// saturated (an idle slot costs ~0.75 pp of crown probability per 23 min)
+// and to tighten the HEAD-class mean, which is the dominant uncertainty in
+// the campaign plan.
 import Darwin
 import Foundation
 import MLXFastCore
