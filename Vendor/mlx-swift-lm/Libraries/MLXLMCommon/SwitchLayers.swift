@@ -246,15 +246,23 @@ private let routeFusedScatterEnabled =
 
 private let routeFusedScatterTopK = 8
 
-private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
+private func makeRouteFusedScatterKernel(
+    expertBoundsSidecar: Bool
+) -> MLXFast.MLXFastKernel {
     let m = routeFusedScatterTopK
+    let expertBoundsValue = expertBoundsSidecar ? "true" : "false"
+    let expertBoundsSuffix = expertBoundsSidecar ? "_eb_1" : ""
     return MLXFast.metalKernel(
-        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_v4",
+        name: "mlx_lm_route_csort_scatter_fused_m\(m)_u32_v4\(expertBoundsSuffix)",
         inputNames: ["keys"],
         outputNames: ["row_order", "sorted_keys", "inverse_order"],
         source: """
             constexpr uint TILE = \(routeSortTile);
             constexpr uint M = \(m);
+            constexpr bool EXPERT_BOUNDS_SIDECAR = \(expertBoundsValue);
+            constexpr uint EXPERT_BOUNDS_MARKER_WORDS = 16;
+            constexpr uint SORTED_KEYS_OFFSET =
+                EXPERT_BOUNDS_SIDECAR ? EXPERT_BOUNDS_MARKER_WORDS : 0;
             uint t = threadgroup_position_in_grid.x;
             uint k = thread_position_in_threadgroup.x;
             uint simd_id = k / 32;
@@ -298,8 +306,21 @@ private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
             for (uint s = 0; s < simd_id; ++s) {
                 simd_base += simd_totals[s];
             }
+            uint global_base = simd_base + lane_excl;
+            // Only the designated sorter threadgroup publishes the global
+            // 257-entry expert-prefix table. Every threadgroup computes the
+            // same integer totals, but restricting writes to t==0 avoids a
+            // multi-threadgroup race. The first 16 physical words remain an
+            // unused 64-byte structural marker; the returned logical view
+            // begins immediately after them.
+            if (EXPERT_BOUNDS_SIDECAR && t == 0) {
+                sorted_keys[SORTED_KEYS_OFFSET + k] = global_base;
+                if (k == 255) {
+                    sorted_keys[SORTED_KEYS_OFFSET + 256] = n;
+                }
+            }
             // Rank base for key k in tile t: global base + earlier tiles.
-            uint off = simd_base + lane_excl +
+            uint off = global_base +
                 atomic_load_explicit(&tg_before[k], memory_order_relaxed);
             // Walk this tile's slice in input order: stability by
             // construction, exactly the stock scatter's write order.
@@ -307,7 +328,13 @@ private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
                 uint idx = t * TILE + i;
                 if (keys[idx] == k) {
                     row_order[off] = idx / M;
-                    sorted_keys[off] = k;
+                    // In sidecar mode logical entries 0...256 belong to the
+                    // exact bounds table. Retain ordinary sorted keys for
+                    // the remainder so the payload stays diagnostic without
+                    // overlapping the authoritative table.
+                    if (!EXPERT_BOUNDS_SIDECAR || off > 256) {
+                        sorted_keys[SORTED_KEYS_OFFSET + off] = k;
+                    }
                     inverse_order[idx] = off;
                     ++off;
                 }
@@ -315,32 +342,56 @@ private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
             """,
         ensureRowContiguous: false
     )
-}()
+}
+
+private let routeFusedScatterKernel = makeRouteFusedScatterKernel(
+    expertBoundsSidecar: false)
+private let routeFusedScatterExpertBoundsKernel = makeRouteFusedScatterKernel(
+    expertBoundsSidecar: true)
 
 private func routeCountingSortFused(
-    _ indices: MLXArray, m: Int
+    _ indices: MLXArray, m: Int, expertBoundsSidecar: Bool
 ) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
     let n = indices.size
     guard routeFusedScatterEnabled, routeCountingSortEnabled,
         indices.dtype == .uint32,
         n > 0, n % routeSortTile == 0,
-        m == routeFusedScatterTopK
+        m == routeFusedScatterTopK,
+        !expertBoundsSidecar || n > 256
     else { return nil }
     let tiles = n / routeSortTile
-    let outputs = routeFusedScatterKernel(
+    let sortedKeysMarkerWords = expertBoundsSidecar ? 16 : 0
+    let kernel = expertBoundsSidecar
+        ? routeFusedScatterExpertBoundsKernel
+        : routeFusedScatterKernel
+    let outputs = kernel(
         [indices],
         grid: (tiles * 256, 1, 1),
         threadGroup: (256, 1, 1),
-        outputShapes: [[n], [n], [n]],
+        outputShapes: [[n], [n + sortedKeysMarkerWords], [n]],
         outputDTypes: [.uint32, .uint32, .uint32]
     )
-    return (outputs[0], outputs[1], outputs[2])
+    // A zero-stride logical view is the backend-visible certificate for the
+    // sidecar. Ordinary contiguous offset-64 slices cannot collide with it;
+    // the backend also requires the dedicated Laguna scale carriers and exact
+    // expert path. That NAX kernel deliberately consumes the contiguous
+    // backing words directly.
+    let sortedKeys = expertBoundsSidecar
+        ? asStrided(outputs[1], [n], strides: [0], offset: 16)
+        : outputs[1]
+    return (outputs[0], sortedKeys, outputs[2])
 }
 
-public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+public func gatherSort(
+    x: MLXArray,
+    indices: MLXArray,
+    expertBoundsSidecar: Bool = false
+) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
-    if let fused = routeCountingSortFused(indices, m: m) {
+    if let fused = routeCountingSortFused(
+        indices, m: m, expertBoundsSidecar: expertBoundsSidecar
+    ) {
         return (
             x.flattened(start: 0, end: -3)[fused.rowOrder],
             fused.sortedKeys,

@@ -468,10 +468,11 @@ public final class LagunaRuntimeWeightCache {
         }
     }
 
-    /// One prefill-shaped forward (512 tokens) and one single-token decode
-    /// step against a throwaway cache, evaluated and discarded. Inputs are
-    /// constant BOS tokens, so this is prompt-independent and cannot affect
-    /// model output; freed warmup buffers remain eligible for allocator
+    /// One ranked prefill-shaped forward (512 tokens), the exact sidecar's
+    /// fallback pipeline shape when enabled (129 tokens), and one single-token
+    /// decode step against throwaway caches, evaluated and discarded. Inputs
+    /// are constant BOS tokens, so this is prompt-independent and cannot
+    /// affect model output; freed warmup buffers remain eligible for allocator
     /// reuse.
     private static func warmLibraryModel(_ model: LagunaRuntimeModel) {
         let bosToken = Int32(LagunaConstants.bosTokenID)
@@ -481,6 +482,26 @@ public final class LagunaRuntimeWeightCache {
             [1, 512]
         )
         eval(model(prefillTokens, cache: warmupCache))
+        // N1's production 512-token path admits the exact expert-bounds
+        // sidecar and therefore warms only the `_eb_1` NAX pipelines. Hidden
+        // behavior prompts can have a routed-row count that is large enough
+        // for the expert path but not divisible by the fused sorter's 128-row
+        // tile, which intentionally falls back to ordinary sorted keys and
+        // `_eb_0`. Warm one prompt-independent 129-token shape in a separate
+        // throwaway cache so both pipeline identities exist before protocol
+        // hello. (16 tokens would not reach the >=1024-row expert consumer.)
+        if lagunaExpertBoundsSidecarEnabled,
+            lagunaExpertAlignedGatherEnabled,
+            lagunaPrefillExpertPairwiseScalesEnabled,
+            lagunaPrefillExpertDownPairwiseScalesEnabled
+        {
+            let fallbackWarmupCache = model.newCache(parameters: nil)
+            let fallbackTokens = MLXArray(
+                Array(repeating: bosToken, count: 129),
+                [1, 129]
+            )
+            eval(model(fallbackTokens, cache: fallbackWarmupCache))
+        }
         let decodeToken = MLXArray([bosToken], [1, 1])
         var warmDecodeLogits = model(decodeToken, cache: warmupCache)
         eval(warmDecodeLogits)
