@@ -1,9 +1,3 @@
-//
-//  RoPEUtils.swift
-//  mlx-swift-lm
-//
-//  Created by John Mai on 2025/8/11.
-//
 
 import Foundation
 import MLX
@@ -111,16 +105,6 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
             let exponents =
                 MLXArray(stride(from: 0, to: rotatedDims, by: 2)).asType(.float32) / Float(dims)
             let realFreqs = factor * MLX.pow(base, exponents)
-            // Pad the pass-through pairs with +inf "frequencies" so a single
-            // MLXFast.RoPE over the FULL `dims` leaves them unrotated
-            // (angle = offset / inf = 0). This reproduces the previous explicit
-            // split/concat/reconstruct partial rotary EXACTLY (verified
-            // bit-identical) in one fused dispatch, mirroring the mlx_lm Python
-            // `ProportionalRoPE` reference. NOTE: this is deliberately NOT a
-            // default RoPE over `rotatedDims` dims — that rotates different pairs
-            // (x[i],x[rotatedDims/2+i]) with /rotatedDims frequencies and is
-            // numerically wrong for Gemma4 (the weights expect /dims, partner at
-            // dims/2).
             let padCount = (dims - rotatedDims) / 2
             if padCount > 0 {
                 let pad = MLXArray(Array(repeating: Float.infinity, count: padCount))
@@ -139,11 +123,6 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
         guard rotatedDims > 0, let _freqs else {
             return x
         }
-        // Single fused partial RoPE over the full head dim. `_freqs` carries +inf
-        // entries for the pass-through pairs (built in init), so MLXFast.RoPE
-        // rotates only the first `rotatedDims` pairs and leaves the rest
-        // unchanged — bit-identical to the previous split/concat/reconstruct path
-        // but in one dispatch. Trailing dims beyond `dims` pass through natively.
         return MLXFast.RoPE(
             x,
             dimensions: dims,
@@ -159,8 +138,6 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
         guard rotatedDims > 0, let _freqs else {
             return x
         }
-        // Batched-offset twin of the scalar path above: one fused MLXFast.RoPE
-        // over the full head dim with the inf-padded `_freqs`.
         return MLXFast.RoPE(
             x,
             dimensions: dims,
@@ -254,9 +231,6 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
             dimensions: dimensions,
             traditional: traditional,
             base: nil,
-            // A negative scale is an internal AOT-kernel sentinel: keep the
-            // angle scale at one and apply mscale to each rotary input with
-            // the same dtype round-trip as the former multiply/update pass.
             scale: _mscale == 1.0 ? 1.0 : -_mscale,
             offset: offset,
             freqs: self._freqs
@@ -364,9 +338,6 @@ public func initializeRope(
             longFactor: longFactor
         )
     } else if ropeType == "mrope" {
-        // MRoPE returns basic RoPE here. The actual multi-modal rotary embedding logic
-        // (applying different embeddings per modality) is handled in the attention layer
-        // of multimodal models like Qwen2VL, not in the RoPE module itself.
         if let config = scalingConfig,
             let mropeSection = config["mrope_section"]?.asInts()
         {

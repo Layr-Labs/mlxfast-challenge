@@ -7,9 +7,11 @@
 
 using namespace mlx::steel;
 
-// DARKBLOOM_ATTN_QHOIST default. DEFAULT OFF: unless the compiler is invoked
-// with -DDARKBLOOM_ATTN_QHOIST=1, the kernel below is byte-for-byte the
-// upstream algorithm.
+// DARKBLOOM_ATTN_QHOIST default. DEFAULT ON for the ranked candidate: stage
+// the loop-invariant Q fragments once before the kb loop instead of re-reading
+// them from device memory on every K block. Compile with
+// -DDARKBLOOM_ATTN_QHOIST=0 for an emergency opt-out, which recovers the stock
+// in-loop Q reload byte-for-byte.
 //
 // NOTE ON WHICH TWIN RUNS. steel/attn is a JIT family: the runtime-effective
 // source is the string in Cmlx/mlx-generated/steel_attention_nax.cpp, and the
@@ -20,7 +22,7 @@ using namespace mlx::steel;
 // tools/build-mlx-metallib.sh -- the AOT copy is reachable only by adding the
 // define to the metallib build flags by hand.
 #ifndef DARKBLOOM_ATTN_QHOIST
-#define DARKBLOOM_ATTN_QHOIST 0
+#define DARKBLOOM_ATTN_QHOIST 1
 #endif
 
 // DARKBLOOM_ATTN_QBLOCK_MAJOR default. DEFAULT ON for the standalone ranked

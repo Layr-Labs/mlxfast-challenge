@@ -7,10 +7,12 @@ const char* steel_attention_nax() {
 
 // Auto generated source for mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h
 
-// DARKBLOOM_ATTN_QHOIST default. DEFAULT OFF: unless the host prepends a
-// `#define DARKBLOOM_ATTN_QHOIST 1` ahead of this string (see
-// get_steel_attention_nax_kernel in mlx/backend/metal/jit_kernels.cpp), the
-// kernel below is byte-for-byte the upstream algorithm.
+// DARKBLOOM_ATTN_QHOIST default. DEFAULT ON for the ranked candidate: stage
+// the loop-invariant Q fragments once before the kb loop instead of re-reading
+// them from device memory on every K block. The JIT host may prepend an
+// explicit `#define DARKBLOOM_ATTN_QHOIST 0` (see
+// get_steel_attention_nax_kernel in mlx/backend/metal/jit_kernels.cpp) as an
+// emergency opt-out, which recovers the stock in-loop Q reload byte-for-byte.
 //
 // The flag is deliberately a preprocessor define baked into the JIT source
 // string, NOT a Metal function constant. A function constant participates in
@@ -21,7 +23,7 @@ const char* steel_attention_nax() {
 // once, when the library source string is assembled, so exactly one variant is
 // ever compiled per process.
 #ifndef DARKBLOOM_ATTN_QHOIST
-#define DARKBLOOM_ATTN_QHOIST 0
+#define DARKBLOOM_ATTN_QHOIST 1
 #endif
 
 // DARKBLOOM_ATTN_QBLOCK_MAJOR default. DEFAULT ON for the standalone ranked
