@@ -603,6 +603,41 @@ let lagunaFusedFullQKNormYaRNEnabled =
 let lagunaRoPEAngleAtlasEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROPE_ANGLE_ATLAS"] != "0"
 
+/// Carry fused-attention parameters in an aligned 16-byte angle-row tail.
+/// All-family cache proof admits PC1; every unsupported state stays on PC0.
+let lagunaAttentionParamsRoPESidecarEnabled =
+    ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ATTN_PARAMS_ROPE_SIDECAR"] != "0"
+let lagunaAttentionScaleLiteralEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ATTN_SCALE_LITERAL"] != "0"
+// PC2 persistence replica; no executable change.
+// Independent primary-slot continuation; executable behavior remains identical.
+// Two-minute queue-monitor refill; the PC2 executable path is unchanged.
+private let lagunaAttentionScaleBits: UInt32 = 0x3DB5_04F3
+
+struct LagunaDecodeAttentionParamsProof {
+    let position: Int
+    let fullWriteIdx: Int
+    let fullCapacity: Int
+    let slidingWriteIdx: Int
+
+    var producerParams: MLXArray {
+        MLXArray([
+            UInt32(position), UInt32(fullWriteIdx),
+            UInt32(fullCapacity), UInt32(slidingWriteIdx),
+        ])
+    }
+
+    func matchesFull(writeIdx: Int, capacity: Int) -> Bool {
+        fullWriteIdx == writeIdx && fullCapacity == capacity
+    }
+
+    func matchesSliding(writeIdx: Int, capacity: Int) -> Bool {
+        slidingWriteIdx == writeIdx &&
+            capacity == LagunaConstants.slidingWindow
+    }
+}
+
 /// Zero-dispatch decode angle carrier: serve the two per-step RoPE angle rows
 /// as contiguous row VIEWS of the load-time FP32 position atlases instead of
 /// running the two probe RoPE dispatches every token. Unlike the fused
@@ -1413,15 +1448,7 @@ func lagunaSlidingQKNormRoPE(
 let lagunaFusedSlidingAttentionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SLIDING_ATTN"] != "0"
 
-private let lagunaSlidingFusedAttentionKernel = MLXFast.metalKernel(
-    name: "laguna_sliding_fused_attn_ring_v1",
-    inputNames: [
-        "raw_queries", "raw_keys", "raw_values",
-        "query_weight", "key_weight", "angles",
-        "k_cache", "v_cache", "params", "scale_arr",
-    ],
-    outputNames: ["attended"],
-    source: """
+private let lagunaSlidingFusedAttentionSource = """
 constexpr uint head_dim = 128;
 constexpr uint window = 512;
 constexpr uint gqa = 8;
@@ -1707,8 +1734,9 @@ if (lane == 0) {
         pair_out1[p] = static_cast<bfloat>(pair_o1[p]);
     }
 }
-""",
-    header: """
+"""
+
+private let lagunaFusedAttentionHeader = """
 #define LAGUNA_RESCALE(dst, delta_expr)         \\
   do {                                          \\
     const float db_delta_ = (delta_expr);       \\
@@ -1756,7 +1784,52 @@ if (lane == 0) {
   } while (false)
 
 
-""",
+"""
+
+private let lagunaFusedAttentionInputNames = [
+    "raw_queries", "raw_keys", "raw_values", "query_weight", "key_weight",
+    "angles", "k_cache", "v_cache",
+]
+
+private let lagunaSlidingFusedAttentionPC0Kernel = MLXFast.metalKernel(
+    name: "laguna_sliding_fused_attn_ring_pc0_v1",
+    inputNames: lagunaFusedAttentionInputNames + ["params", "scale_arr"],
+    outputNames: ["attended"],
+    source: lagunaSlidingFusedAttentionSource,
+    header: lagunaFusedAttentionHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaSlidingFusedAttentionPC1Source =
+    lagunaSlidingFusedAttentionSource.replacingOccurrences(
+        of: "uint widx = params[0];",
+        with: """
+        const device uint* decode_params =
+            reinterpret_cast<const device uint*>(angles + 128);
+        bool descriptor_valid =
+            decode_params[3] == 0x50433101u &&
+            decode_params[0] < window &&
+            decode_params[1] == window && decode_params[2] == window;
+        uint widx = descriptor_valid ? decode_params[0] : 0u;
+        """)
+
+private let lagunaSlidingFusedAttentionPC1Kernel = MLXFast.metalKernel(
+    name: "laguna_sliding_fused_attn_ring_pc1_v1",
+    inputNames: lagunaFusedAttentionInputNames + ["scale_arr"],
+    outputNames: ["attended"],
+    source: lagunaSlidingFusedAttentionPC1Source,
+    header: lagunaFusedAttentionHeader,
+    ensureRowContiguous: true
+)
+
+private let lagunaSlidingFusedAttentionPC2Kernel = MLXFast.metalKernel(
+    name: "laguna_sliding_fused_attn_ring_pc2_v1",
+    inputNames: lagunaFusedAttentionInputNames,
+    outputNames: ["attended"],
+    source: lagunaSlidingFusedAttentionPC1Source.replacingOccurrences(
+        of: "float scale = scale_arr[0];",
+        with: "float scale = as_type<float>(0x3DB504F3u);"),
+    header: lagunaFusedAttentionHeader,
     ensureRowContiguous: true
 )
 
@@ -1773,7 +1846,9 @@ func lagunaSlidingFusedAttention(
     cacheKeys: MLXArray,
     cacheValues: MLXArray,
     writeIdx: Int,
-    scale: MLXArray
+    scale: MLXArray,
+    sidecarProof: LagunaDecodeAttentionParamsProof? = nil,
+    scaleBitPattern: UInt32? = nil
 ) -> MLXArray {
     let heads = LagunaConstants.slidingAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
@@ -1787,7 +1862,12 @@ func lagunaSlidingFusedAttention(
     precondition(queryWeight.dims(LagunaConstants.headDim))
     precondition(keyWeight.dims(LagunaConstants.headDim))
     precondition(angles.dtype == .float32)
-    precondition(angles.dims(1, 1, 1, LagunaConstants.headDim))
+    let usePC1 = lagunaAttentionParamsRoPESidecarEnabled &&
+        angles.dims(1, 1, 1, LagunaConstants.headDim + 4) &&
+        sidecarProof?.matchesSliding(writeIdx: writeIdx, capacity: window) == true
+    let usePC2 = usePC1 && lagunaAttentionScaleLiteralEnabled &&
+        LagunaConstants.headDim == 128 && scaleBitPattern == lagunaAttentionScaleBits
+    precondition(usePC1 || angles.dims(1, 1, 1, LagunaConstants.headDim))
     precondition(cacheKeys.dtype == .bfloat16)
     precondition(
         cacheKeys.dims(1, kvHeads, window, LagunaConstants.headDim))
@@ -1796,15 +1876,31 @@ func lagunaSlidingFusedAttention(
     precondition(writeIdx >= 0 && writeIdx < window)
     precondition(scale.dtype == .float32 && scale.size == 1)
 
-    lagunaTrace("sliding fused attention")
-    let params = lagunaParamsAtlasEnabled
-        ? lagunaRingIdxAtlas[writeIdx] : MLXArray([UInt32(writeIdx)])
-    return lagunaSlidingFusedAttentionKernel(
-        [
+    lagunaTrace(usePC2
+        ? "sliding fused attention pc2 literal"
+        : usePC1 ? "sliding fused attention pc1 rope sidecar"
+        : "sliding fused attention pc0")
+    let commonInputs: [any ScalarOrArray] = [
             rawQueries, rawKeys, rawValues,
             queryWeight, keyWeight, angles,
-            cacheKeys, cacheValues, params, scale,
-        ],
+            cacheKeys, cacheValues,
+        ]
+    let kernel: MLXFast.MLXFastKernel
+    let inputs: [any ScalarOrArray]
+    if usePC2 {
+        kernel = lagunaSlidingFusedAttentionPC2Kernel
+        inputs = commonInputs
+    } else if usePC1 {
+        kernel = lagunaSlidingFusedAttentionPC1Kernel
+        inputs = commonInputs + [scale]
+    } else {
+        let params = lagunaParamsAtlasEnabled
+            ? lagunaRingIdxAtlas[writeIdx] : MLXArray([UInt32(writeIdx)])
+        kernel = lagunaSlidingFusedAttentionPC0Kernel
+        inputs = commonInputs + [params, scale]
+    }
+    return kernel(
+        inputs,
         grid: ((heads / 2) * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
@@ -1862,15 +1958,7 @@ let lagunaFusedFullAttentionKernelWarmupEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_FULL_ATTN_KERNEL_WARMUP"] != "0"
 
-private let lagunaFullFusedAttentionKernel = MLXFast.metalKernel(
-    name: "laguna_full_fused_attn_grow_v1",
-    inputNames: [
-        "raw_queries", "raw_keys", "raw_values",
-        "query_weight", "key_weight", "angles",
-        "k_cache", "v_cache", "params", "scale_arr",
-    ],
-    outputNames: ["attended"],
-    source: """
+private let lagunaFullFusedAttentionSource = """
 constexpr uint head_dim = 128;
 constexpr uint gqa = 6;
 constexpr int BN = 32;
@@ -2208,56 +2296,54 @@ if (lane == 0) {
         pair_out1[p] = static_cast<bfloat>(pair_o1[p]);
     }
 }
-""",
-    header: """
-#define LAGUNA_RESCALE(dst, delta_expr)         \\
-  do {                                          \\
-    const float db_delta_ = (delta_expr);       \\
-    if (as_type<uint>(db_delta_) == 0u) {       \\
-      dst = float(1.0f);                        \\
-    } else {                                    \\
-      dst = metal::fast::exp(db_delta_);        \\
-    }                                           \\
-  } while (false)
+"""
 
-#define T_LOAD_K(dst, substitute, ptr)                     \\
-  do {                                                     \\
-    if (substitute) {                                      \\
-      dst[0] = tg_k[lane * qk_per_thread + 0];             \\
-      dst[1] = tg_k[lane * qk_per_thread + 1];             \\
-      dst[2] = tg_k[lane * qk_per_thread + 2];             \\
-      dst[3] = tg_k[lane * qk_per_thread + 3];             \\
-    } else {                                               \\
-      const vec<bfloat, 4> v_ =                            \\
-          *reinterpret_cast<const device vec<bfloat, 4>*>( \\
-              ptr);                                        \\
-      dst[0] = v_.x;                                       \\
-      dst[1] = v_.y;                                       \\
-      dst[2] = v_.z;                                       \\
-      dst[3] = v_.w;                                       \\
-    }                                                      \\
-  } while (false)
+private let lagunaFullFusedAttentionPC0Kernel = MLXFast.metalKernel(
+    name: "laguna_full_fused_attn_grow_pc0_v1",
+    inputNames: lagunaFusedAttentionInputNames + ["params", "scale_arr"],
+    outputNames: ["attended"],
+    source: lagunaFullFusedAttentionSource,
+    header: lagunaFusedAttentionHeader,
+    ensureRowContiguous: true
+)
 
-#define T_LOAD_V(d0, d1, d2, d3, substitute, ptr)          \\
-  do {                                                     \\
-    if (substitute) {                                      \\
-      d0 = tg_v[lane * v_per_thread + 0];                  \\
-      d1 = tg_v[lane * v_per_thread + 1];                  \\
-      d2 = tg_v[lane * v_per_thread + 2];                  \\
-      d3 = tg_v[lane * v_per_thread + 3];                  \\
-    } else {                                               \\
-      const vec<bfloat, 4> v_ =                            \\
-          *reinterpret_cast<const device vec<bfloat, 4>*>( \\
-              ptr);                                        \\
-      d0 = v_.x;                                           \\
-      d1 = v_.y;                                           \\
-      d2 = v_.z;                                           \\
-      d3 = v_.w;                                           \\
-    }                                                      \\
-  } while (false)
+private let lagunaFullFusedAttentionPC1Source =
+    lagunaFullFusedAttentionSource.replacingOccurrences(
+        of: """
+        uint widx = params[0];
+        int N = int(params[1]);
+        uint capacity = params[2];
+        """,
+        with: """
+        const device uint* decode_params =
+            reinterpret_cast<const device uint*>(angles + 64);
+        bool descriptor_valid =
+            decode_params[3] == 0x50433101u &&
+            decode_params[2] > 0u && decode_params[0] < decode_params[2] &&
+            decode_params[1] == decode_params[0] + 1u &&
+            decode_params[1] <= decode_params[2];
+        uint widx = descriptor_valid ? decode_params[0] : 0u;
+        int N = descriptor_valid ? int(decode_params[1]) : 1;
+        uint capacity = descriptor_valid ? decode_params[2] : 1u;
+        """)
 
+private let lagunaFullFusedAttentionPC1Kernel = MLXFast.metalKernel(
+    name: "laguna_full_fused_attn_grow_pc1_v1",
+    inputNames: lagunaFusedAttentionInputNames + ["scale_arr"],
+    outputNames: ["attended"],
+    source: lagunaFullFusedAttentionPC1Source,
+    header: lagunaFusedAttentionHeader,
+    ensureRowContiguous: true
+)
 
-""",
+private let lagunaFullFusedAttentionPC2Kernel = MLXFast.metalKernel(
+    name: "laguna_full_fused_attn_grow_pc2_v1",
+    inputNames: lagunaFusedAttentionInputNames,
+    outputNames: ["attended"],
+    source: lagunaFullFusedAttentionPC1Source.replacingOccurrences(
+        of: "float scale = scale_arr[0];",
+        with: "float scale = as_type<float>(0x3DB504F3u);"),
+    header: lagunaFusedAttentionHeader,
     ensureRowContiguous: true
 )
 
@@ -2274,7 +2360,9 @@ func lagunaFullFusedAttention(
     cacheKeys: MLXArray,
     cacheValues: MLXArray,
     writeIdx: Int,
-    scale: MLXArray
+    scale: MLXArray,
+    sidecarProof: LagunaDecodeAttentionParamsProof? = nil,
+    scaleBitPattern: UInt32? = nil
 ) -> MLXArray {
     let heads = LagunaConstants.fullAttentionHeads
     let kvHeads = LagunaConstants.numKeyValueHeads
@@ -2288,7 +2376,13 @@ func lagunaFullFusedAttention(
     precondition(queryWeight.dims(LagunaConstants.headDim))
     precondition(keyWeight.dims(LagunaConstants.headDim))
     precondition(angles.dtype == .float32)
-    precondition(angles.dims(1, 1, 1, LagunaConstants.headDim / 2))
+    let usePC1 = lagunaAttentionParamsRoPESidecarEnabled &&
+        angles.dims(1, 1, 1, LagunaConstants.headDim / 2 + 4) &&
+        sidecarProof?.matchesFull(writeIdx: writeIdx, capacity: capacity) == true
+    let usePC2 = usePC1 && lagunaAttentionScaleLiteralEnabled &&
+        LagunaConstants.headDim == 128 && scaleBitPattern == lagunaAttentionScaleBits
+    precondition(usePC1 ||
+        angles.dims(1, 1, 1, LagunaConstants.headDim / 2))
     precondition(cacheKeys.dtype == .bfloat16)
     precondition(
         cacheKeys.dims(1, kvHeads, capacity, LagunaConstants.headDim))
@@ -2297,16 +2391,32 @@ func lagunaFullFusedAttention(
     precondition(writeIdx >= 0 && writeIdx < capacity)
     precondition(scale.dtype == .float32 && scale.size == 1)
 
-    lagunaTrace("full fused attention")
-    let params = MLXArray([
-        UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
-    ])
-    return lagunaFullFusedAttentionKernel(
-        [
+    lagunaTrace(usePC2
+        ? "full fused attention pc2 literal"
+        : usePC1 ? "full fused attention pc1 rope sidecar"
+        : "full fused attention pc0")
+    let commonInputs: [any ScalarOrArray] = [
             rawQueries, rawKeys, rawValues,
             queryWeight, keyWeight, angles,
-            cacheKeys, cacheValues, params, scale,
-        ],
+            cacheKeys, cacheValues,
+        ]
+    let kernel: MLXFast.MLXFastKernel
+    let inputs: [any ScalarOrArray]
+    if usePC2 {
+        kernel = lagunaFullFusedAttentionPC2Kernel
+        inputs = commonInputs
+    } else if usePC1 {
+        kernel = lagunaFullFusedAttentionPC1Kernel
+        inputs = commonInputs + [scale]
+    } else {
+        let params = MLXArray([
+            UInt32(writeIdx), UInt32(writeIdx + 1), UInt32(capacity),
+        ])
+        kernel = lagunaFullFusedAttentionPC0Kernel
+        inputs = commonInputs + [params, scale]
+    }
+    return kernel(
+        inputs,
         grid: ((heads / 2) * 1024, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [[1, heads, 1, LagunaConstants.headDim]],
@@ -2349,6 +2459,59 @@ func lagunaWarmFullFusedAttentionKernel() {
         writeIdx: 1,
         scale: scale
     ))
+}
+
+/// Ordinary warm covers PC0; explicitly warm the sidecar identities.
+func lagunaWarmAttentionParamsRoPESidecarKernels(_ model: LagunaRuntimeModel) {
+    guard lagunaAttentionParamsRoPESidecarEnabled,
+        let fullAtlas = model.model._fullRoPEAngleAtlas,
+        let slidingAtlas = model.model._slidingRoPEAngleAtlas
+    else { return }
+    let d = LagunaConstants.headDim
+    let kv = LagunaConstants.numKeyValueHeads
+    let proof = LagunaDecodeAttentionParamsProof(
+        position: 0, fullWriteIdx: 1, fullCapacity: 2, slidingWriteIdx: 1)
+    guard let produced = lagunaDecodeEmbeddingRoPEAtlas(
+        tokens: MLXArray([Int32(LagunaConstants.bosTokenID)], [1, 1]),
+        embeddingWeight: model.model.embedTokens.weight,
+        fullAtlas: fullAtlas, slidingAtlas: slidingAtlas, position: 0,
+        sidecarProof: proof)
+    else { return }
+    let keys = MLXArray.zeros([1, 1, kv * d], dtype: .bfloat16)
+    let values = MLXArray.zeros([1, 1, kv * d], dtype: .bfloat16)
+    let qw = MLXArray.ones([d], dtype: .bfloat16)
+    let kw = MLXArray.ones([d], dtype: .bfloat16)
+    let scale = MLXArray([pow(Float(d), -0.5)])
+    func full(_ bits: UInt32?) -> MLXArray {
+        lagunaFullFusedAttention(
+            rawQueries: MLXArray.zeros(
+                [1, 1, LagunaConstants.fullAttentionHeads * d], dtype: .bfloat16),
+            rawKeys: keys, rawValues: values, queryWeight: qw, keyWeight: kw,
+            angles: produced.fullAngles,
+            cacheKeys: MLXArray.zeros([1, kv, 2, d], dtype: .bfloat16),
+            cacheValues: MLXArray.zeros([1, kv, 2, d], dtype: .bfloat16),
+            writeIdx: 1, scale: scale, sidecarProof: proof,
+            scaleBitPattern: bits)
+    }
+    let window = LagunaConstants.slidingWindow
+    func sliding(_ bits: UInt32?) -> MLXArray {
+        lagunaSlidingFusedAttention(
+            rawQueries: MLXArray.zeros(
+                [1, 1, LagunaConstants.slidingAttentionHeads * d], dtype: .bfloat16),
+            rawKeys: keys, rawValues: values, queryWeight: qw, keyWeight: kw,
+            angles: produced.slidingAngles,
+            cacheKeys: MLXArray.zeros([1, kv, window, d], dtype: .bfloat16),
+            cacheValues: MLXArray.zeros([1, kv, window, d], dtype: .bfloat16),
+            writeIdx: 1, scale: scale, sidecarProof: proof,
+            scaleBitPattern: bits)
+    }
+    let fullPC1 = full(nil)
+    let fullPC2 = full(lagunaAttentionScaleBits)
+    let slidingPC1 = sliding(nil)
+    let slidingPC2 = sliding(lagunaAttentionScaleBits)
+    lagunaTrace("warm attention pc1+pc2 identities")
+    eval([produced.hidden, produced.fullAngles, produced.slidingAngles,
+        fullPC1, fullPC2, slidingPC1, slidingPC2])
 }
 
 /// Multi-token sliding-layer Q/K RMSNorm + plain RoPE fusion. One dispatch
@@ -5736,7 +5899,8 @@ final class LagunaRuntimeAttention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        attentionParamsProof: LagunaDecodeAttentionParamsProof? = nil
     ) -> MLXArray {
         let (B, L) = (input.dim(0), input.dim(1))
 
@@ -5963,14 +6127,24 @@ final class LagunaRuntimeAttention: Module {
             fusedQKNormShapesMatch &&
             nHeads == LagunaConstants.fullAttentionHeads &&
             qkRoPEAngles?.dtype == .float32 &&
-            qkRoPEAngles?.dims(1, 1, 1, headDim / 2) == true
+            (
+                qkRoPEAngles?.dims(1, 1, 1, headDim / 2) == true ||
+                    (lagunaAttentionParamsRoPESidecarEnabled &&
+                        attentionParamsProof != nil &&
+                        qkRoPEAngles?.dims(1, 1, 1, headDim / 2 + 4) == true)
+            )
 
         let useFusedSlidingQKNormRoPE =
             lagunaFusedSlidingQKNormRoPEEnabled && isSliding &&
             fusedQKNormShapesMatch &&
             nHeads == LagunaConstants.slidingAttentionHeads &&
             qkRoPEAngles?.dtype == .float32 &&
-            qkRoPEAngles?.dims(1, 1, 1, headDim) == true
+            (
+                qkRoPEAngles?.dims(1, 1, 1, headDim) == true ||
+                    (lagunaAttentionParamsRoPESidecarEnabled &&
+                        attentionParamsProof != nil &&
+                        qkRoPEAngles?.dims(1, 1, 1, headDim + 4) == true)
+            )
 
         // Multi-token twins of the decode fusions. The angle input is the
         // full load-time atlas (one cos/sin row per absolute position) and
@@ -6026,7 +6200,9 @@ final class LagunaRuntimeAttention: Module {
                 cacheKeys: ring.keys,
                 cacheValues: ring.values,
                 writeIdx: ring.writeIdx,
-                scale: _fusedAttnScale
+                scale: _fusedAttnScale,
+                sidecarProof: attentionParamsProof,
+                scaleBitPattern: scale.bitPattern
             )
             rotating.fusedRingAdvance()
             qkNormRoPEFused = true
@@ -6052,26 +6228,34 @@ final class LagunaRuntimeAttention: Module {
                 cacheKeys: append.keys,
                 cacheValues: append.values,
                 writeIdx: append.writeIdx,
-                scale: _fusedAttnScale
+                scale: _fusedAttnScale,
+                sidecarProof: attentionParamsProof,
+                scaleBitPattern: scale.bitPattern
             )
             simple.fusedAppendAdvance()
             qkNormRoPEFused = true
         } else if useFusedFullQKNormYaRN, let qkRoPEAngles {
+            let angles = qkRoPEAngles.dim(-1) == headDim / 2 + 4
+                ? qkRoPEAngles[0..., 0..., 0..., 0 ..< (headDim / 2)]
+                : qkRoPEAngles
             (queries, keys) = lagunaFullQKNormYaRN(
                 rawQueries: queries,
                 rawKeys: keys,
                 queryWeight: qNorm.weight,
                 keyWeight: kNorm.weight,
-                angles: qkRoPEAngles
+                angles: angles
             )
             qkNormRoPEFused = true
         } else if useFusedSlidingQKNormRoPE, let qkRoPEAngles {
+            let angles = qkRoPEAngles.dim(-1) == headDim + 4
+                ? qkRoPEAngles[0..., 0..., 0..., 0 ..< headDim]
+                : qkRoPEAngles
             (queries, keys) = lagunaSlidingQKNormRoPE(
                 rawQueries: queries,
                 rawKeys: keys,
                 queryWeight: qNorm.weight,
                 keyWeight: kNorm.weight,
-                angles: qkRoPEAngles
+                angles: angles
             )
             qkNormRoPEFused = true
         } else if usePrefillFusedSlidingQKNormRoPE,
@@ -11010,7 +11194,8 @@ final class LagunaRuntimeDecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?,
         qkRoPEAngles: MLXArray? = nil,
-        qkRoPEOffsets: MLXArray? = nil
+        qkRoPEOffsets: MLXArray? = nil,
+        attentionParamsProof: LagunaDecodeAttentionParamsProof? = nil
     ) -> MLXArray {
         let r = selfAttn(
             x,
@@ -11018,7 +11203,8 @@ final class LagunaRuntimeDecoderLayer: Module {
             mask: mask,
             cache: cache,
             qkRoPEAngles: qkRoPEAngles,
-            qkRoPEOffsets: qkRoPEOffsets
+            qkRoPEOffsets: qkRoPEOffsets,
+            attentionParamsProof: attentionParamsProof
         )
         let h: MLXArray
         let normalized: MLXArray
@@ -11188,18 +11374,7 @@ final class LagunaRuntimeDecoderLayer: Module {
 
 // MARK: - Model
 
-/// Single-token embedding gather plus position-atlas row selection. The
-/// embedding row is copied as BF16 bits; the angle rows are copied as FP32
-/// bits. The stock embedding and the two stock probe RoPE calls produce the
-/// same three output buffers separately.
-private let lagunaDecodeEmbeddingRoPEAtlasKernel = MLXFast.metalKernel(
-    name: "laguna_decode_embedding_rope_atlas_bf16_2048_v2",
-    inputNames: [
-        "tokens", "embedding_weight", "full_atlas", "sliding_atlas",
-        "atlas_position",
-    ],
-    outputNames: ["hidden", "full_angles", "sliding_angles"],
-    source: """
+private let lagunaDecodeEmbeddingRoPEAtlasSource = """
 constexpr uint hidden_size = 2048;
 constexpr uint hidden_vectors = hidden_size / 4;
 constexpr uint full_width = 64;
@@ -11208,40 +11383,56 @@ constexpr uint sliding_width = 128;
 uint lane = thread_position_in_grid.x;
 uint token = uint(tokens[0]);
 uint position = uint(atlas_position);
-
 const device vec<bfloat, 4>* embedding_vectors =
-    (const device vec<bfloat, 4>*)(
-        embedding_weight + token * hidden_size);
-device vec<bfloat, 4>* hidden_vectors_out =
-    (device vec<bfloat, 4>*)(hidden);
-if (lane < hidden_vectors) {
-    hidden_vectors_out[lane] = embedding_vectors[lane];
-}
-
+    (const device vec<bfloat, 4>*)(embedding_weight + token * hidden_size);
+device vec<bfloat, 4>* hidden_vectors_out = (device vec<bfloat, 4>*)(hidden);
+if (lane < hidden_vectors) hidden_vectors_out[lane] = embedding_vectors[lane];
 if (lane < full_width / 4) {
-    const device vec<float, 4>* atlas_vectors =
-        (const device vec<float, 4>*)(
-            full_atlas + position * full_width);
-    ((device vec<float, 4>*)(full_angles))[lane] =
-        atlas_vectors[lane];
+    const device vec<float, 4>* row =
+        (const device vec<float, 4>*)(full_atlas + position * full_width);
+    ((device vec<float, 4>*)(full_angles))[lane] = row[lane];
 }
 if (lane < sliding_width / 4) {
-    const device vec<float, 4>* atlas_vectors =
-        (const device vec<float, 4>*)(
-            sliding_atlas + position * sliding_width);
-    ((device vec<float, 4>*)(sliding_angles))[lane] =
-        atlas_vectors[lane];
+    const device vec<float, 4>* row =
+        (const device vec<float, 4>*)(sliding_atlas + position * sliding_width);
+    ((device vec<float, 4>*)(sliding_angles))[lane] = row[lane];
 }
-""",
-    ensureRowContiguous: true
-)
+"""
+
+private let lagunaDecodeEmbeddingRoPEAtlasKernel = MLXFast.metalKernel(
+    name: "laguna_decode_embedding_rope_atlas_bf16_2048_v2",
+    inputNames: ["tokens", "embedding_weight", "full_atlas", "sliding_atlas",
+        "atlas_position"],
+    outputNames: ["hidden", "full_angles", "sliding_angles"],
+    source: lagunaDecodeEmbeddingRoPEAtlasSource,
+    ensureRowContiguous: true)
+
+private let lagunaDecodeEmbeddingRoPEAtlasSidecarKernel = MLXFast.metalKernel(
+    name: "laguna_decode_embedding_rope_atlas_bf16_2048_pc1_v1",
+    inputNames: ["tokens", "embedding_weight", "full_atlas", "sliding_atlas",
+        "decode_params"],
+    outputNames: ["hidden", "full_angles", "sliding_angles"],
+    source: lagunaDecodeEmbeddingRoPEAtlasSource.replacingOccurrences(
+        of: "uint position = uint(atlas_position);",
+        with: "uint position = decode_params[0];") + """
+    if (lane == 0) {
+        device uint* f = (device uint*)(full_angles + full_width);
+        f[0] = decode_params[1]; f[1] = decode_params[1] + 1u;
+        f[2] = decode_params[2]; f[3] = 0x50433101u;
+        device uint* s = (device uint*)(sliding_angles + sliding_width);
+        s[0] = decode_params[3]; s[1] = 512u;
+        s[2] = 512u; s[3] = 0x50433101u;
+    }
+    """,
+    ensureRowContiguous: true)
 
 private func lagunaDecodeEmbeddingRoPEAtlas(
     tokens: MLXArray,
     embeddingWeight: MLXArray,
     fullAtlas: MLXArray,
     slidingAtlas: MLXArray,
-    position: Int
+    position: Int,
+    sidecarProof: LagunaDecodeAttentionParamsProof? = nil
 ) -> (hidden: MLXArray, fullAngles: MLXArray, slidingAngles: MLXArray)? {
     guard tokens.dtype == .int32,
         tokens.dims(1, 1),
@@ -11256,25 +11447,30 @@ private func lagunaDecodeEmbeddingRoPEAtlas(
         return nil
     }
 
-    let kernelInputs: [any ScalarOrArray] = [
-        tokens,
-        embeddingWeight,
-        fullAtlas,
-        slidingAtlas,
-        Int32(position),
-    ]
-    let outputs = lagunaDecodeEmbeddingRoPEAtlasKernel(
+    let useSidecar = lagunaAttentionParamsRoPESidecarEnabled &&
+        sidecarProof?.position == position
+    let kernelInputs: [any ScalarOrArray] = if let sidecarProof, useSidecar {
+        [tokens, embeddingWeight, fullAtlas, slidingAtlas,
+            sidecarProof.producerParams]
+    } else {
+        [tokens, embeddingWeight, fullAtlas, slidingAtlas, Int32(position)]
+    }
+    let outputs = (useSidecar
+        ? lagunaDecodeEmbeddingRoPEAtlasSidecarKernel
+        : lagunaDecodeEmbeddingRoPEAtlasKernel)(
         kernelInputs,
         grid: (512, 1, 1),
         threadGroup: (512, 1, 1),
         outputShapes: [
             [1, 1, LagunaConstants.hiddenSize],
-            [1, 1, 1, LagunaConstants.headDim / 2],
-            [1, 1, 1, LagunaConstants.headDim],
+            [1, 1, 1, LagunaConstants.headDim / 2 + (useSidecar ? 4 : 0)],
+            [1, 1, 1, LagunaConstants.headDim + (useSidecar ? 4 : 0)],
         ],
         outputDTypes: [.bfloat16, .float32, .float32]
     )
-    lagunaTrace("decode embedding+rope atlas")
+    lagunaTrace(useSidecar
+        ? "decode embedding+rope atlas pc1 sidecar"
+        : "decode embedding+rope atlas pc0")
     return (outputs[0], outputs[1], outputs[2])
 }
 
@@ -11424,6 +11620,65 @@ final class LagunaRuntimeModelInner: Module {
         return fullPosition
     }
 
+    /// Read-only all-family certificate; each consumer rechecks at prepare.
+    private func decodeAttentionParamsProof(
+        inputs: MLXArray, cache: [KVCache]?, position: Int
+    ) -> LagunaDecodeAttentionParamsProof? {
+        guard lagunaAttentionParamsRoPESidecarEnabled,
+            inputs.dtype == .int32, inputs.dims(1, 1),
+            let cache, cache.count == layers.count,
+            layerTypes.count == layers.count
+        else { return nil }
+
+        var fullDescriptor: (writeIdx: Int, count: Int, capacity: Int)?
+        var slidingDescriptor: (writeIdx: Int, count: Int, capacity: Int)?
+        for (index, layerType) in layerTypes.enumerated() {
+            let layerCache = cache[index]
+            guard layerCache.offset == position else { return nil }
+            switch layerType {
+            case .full:
+                guard type(of: layerCache) == KVCacheSimple.self,
+                    let simple = layerCache as? KVCacheSimple,
+                    let descriptor = simple.fusedAppendDescriptor(),
+                    descriptor.writeIdx == position,
+                    descriptor.count == position + 1
+                else { return nil }
+                if let first = fullDescriptor {
+                    guard descriptor.writeIdx == first.writeIdx,
+                        descriptor.count == first.count,
+                        descriptor.capacity == first.capacity
+                    else { return nil }
+                } else {
+                    fullDescriptor = descriptor
+                }
+            case .sliding:
+                guard type(of: layerCache) == RotatingKVCache.self,
+                    layerCache.maxSize == slidingWindow,
+                    let rotating = layerCache as? RotatingKVCache,
+                    let descriptor = rotating.fusedRingDescriptor(),
+                    descriptor.count == slidingWindow,
+                    descriptor.capacity == slidingWindow
+                else { return nil }
+                if let first = slidingDescriptor {
+                    guard descriptor.writeIdx == first.writeIdx,
+                        descriptor.count == first.count,
+                        descriptor.capacity == first.capacity
+                    else { return nil }
+                } else {
+                    slidingDescriptor = descriptor
+                }
+            }
+        }
+
+        guard let fullDescriptor, let slidingDescriptor else { return nil }
+        return LagunaDecodeAttentionParamsProof(
+            position: position,
+            fullWriteIdx: fullDescriptor.writeIdx,
+            fullCapacity: fullDescriptor.capacity,
+            slidingWriteIdx: slidingDescriptor.writeIdx
+        )
+    }
+
     /// Runs `attention`'s own RoPE layer over `seed` at the cache's current
     /// position, honoring a graph-valued offset when the cache carries one.
     private func ropeAngleTable(
@@ -11440,8 +11695,13 @@ final class LagunaRuntimeModelInner: Module {
         var fullRoPEAngles: MLXArray?
         var slidingRoPEAngles: MLXArray?
         var qkRoPEOffsets: MLXArray?
+        var attentionParamsProof: LagunaDecodeAttentionParamsProof?
+        let decodeAtlasPosition = decodeRoPEAtlasPosition(inputs: inputs, cache: cache)
+        let candidateParamsProof = decodeAtlasPosition.flatMap {
+            decodeAttentionParamsProof(inputs: inputs, cache: cache, position: $0)
+        }
         if lagunaRoPEAngleAtlasEnabled,
-            let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
+            let position = decodeAtlasPosition,
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas,
             let atlasOutputs = lagunaDecodeEmbeddingRoPEAtlas(
@@ -11449,13 +11709,15 @@ final class LagunaRuntimeModelInner: Module {
                 embeddingWeight: embedTokens.weight,
                 fullAtlas: fullAtlas,
                 slidingAtlas: slidingAtlas,
-                position: position)
+                position: position,
+                sidecarProof: candidateParamsProof)
         {
             h = atlasOutputs.hidden
             fullRoPEAngles = atlasOutputs.fullAngles
             slidingRoPEAngles = atlasOutputs.slidingAngles
+            attentionParamsProof = candidateParamsProof
         } else if lagunaRoPEAtlasViewsEnabled,
-            let position = decodeRoPEAtlasPosition(inputs: inputs, cache: cache),
+            let position = decodeAtlasPosition,
             let fullAtlas = _fullRoPEAngleAtlas,
             let slidingAtlas = _slidingRoPEAngleAtlas
         {
@@ -11544,7 +11806,8 @@ final class LagunaRuntimeModelInner: Module {
                         mask: mask,
                         cache: cache?[i],
                         qkRoPEAngles: qkRoPEAngles,
-                        qkRoPEOffsets: qkRoPEOffsets
+                        qkRoPEOffsets: qkRoPEOffsets,
+                        attentionParamsProof: attentionParamsProof
                     )
                     if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
                         asyncEval(h)
@@ -11556,7 +11819,8 @@ final class LagunaRuntimeModelInner: Module {
                     mask: mask,
                     cache: cache?[i],
                     qkRoPEAngles: qkRoPEAngles,
-                    qkRoPEOffsets: qkRoPEOffsets
+                    qkRoPEOffsets: qkRoPEOffsets,
+                    attentionParamsProof: attentionParamsProof
                 )
                 if isSingleTokenDecode, (decodeFireMask >> UInt64(i)) & 1 == 1 {
                     asyncEval(h)
