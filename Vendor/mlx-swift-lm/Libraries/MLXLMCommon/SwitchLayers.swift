@@ -382,21 +382,30 @@ private func routeCountingSortFused(
     return (outputs[0], sortedKeys, outputs[2])
 }
 
-public func gatherSort(
-    x: MLXArray,
+public func gatherSortMetadataSupportsExpertBounds(
+    routedRows n: Int, topK: Int
+) -> Bool {
+    return routeFusedScatterEnabled && routeCountingSortEnabled
+        && n > 256 && n % routeSortTile == 0
+        && topK == routeFusedScatterTopK
+}
+
+public func gatherSortMetadataSupportsExpertBounds(indices: MLXArray) -> Bool {
+    indices.dtype == .uint32
+        && gatherSortMetadataSupportsExpertBounds(
+            routedRows: indices.size, topK: indices.dim(-1))
+}
+
+public func gatherSortMetadata(
     indices: MLXArray,
     expertBoundsSidecar: Bool = false
-) -> (MLXArray, MLXArray, MLXArray) {
+) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
     if let fused = routeCountingSortFused(
         indices, m: m, expertBoundsSidecar: expertBoundsSidecar
     ) {
-        return (
-            x.flattened(start: 0, end: -3)[fused.rowOrder],
-            fused.sortedKeys,
-            fused.inverseOrder
-        )
+        return fused
     }
     let order = routeCountingSort(indices) ?? argSort(indices)
     let inverseOrder: MLXArray
@@ -413,9 +422,24 @@ public func gatherSort(
     }
 
     return (
-        x.flattened(start: 0, end: -3)[order.floorDivide(m)],
+        order.floorDivide(m),
         indices[order],
         inverseOrder
+    )
+}
+
+public func gatherSort(
+    x: MLXArray,
+    indices: MLXArray,
+    expertBoundsSidecar: Bool = false
+) -> (MLXArray, MLXArray, MLXArray) {
+    let metadata = gatherSortMetadata(
+        indices: indices,
+        expertBoundsSidecar: expertBoundsSidecar)
+    return (
+        x.flattened(start: 0, end: -3)[metadata.rowOrder],
+        metadata.sortedKeys,
+        metadata.inverseOrder
     )
 }
 

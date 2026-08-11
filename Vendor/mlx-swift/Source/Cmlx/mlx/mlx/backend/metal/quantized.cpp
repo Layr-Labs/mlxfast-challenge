@@ -1331,6 +1331,12 @@ bool darkbloom_expert_aligned_gather() {
   return v;
 }
 
+bool darkbloom_prefill_row_addressed() {
+  static const bool v =
+      env::get_var("DARKBLOOM_PREFILL_ROW_ADDRESSED", "") != "0";
+  return v;
+}
+
 // DARKBLOOM_EXPERT_STAGE_WIDEST (default ON; "0" restores scalar staging as
 // the A/B control): wide 16B threadgroup stores in the expert-aligned gather
 // QMM's weight-staging loader (load_unsafe_wide<true, false>). Store-side
@@ -1640,6 +1646,7 @@ void gather_qmm_rhs_nax(
     const array& w_,
     const array& scales_,
     const std::optional<array>& biases_,
+    const array& row_indices_,
     const array& indices_,
     array& out,
     bool transpose,
@@ -1650,7 +1657,8 @@ void gather_qmm_rhs_nax(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string mode) {
+    const std::string mode,
+    bool row_addressed) {
   const bool expert_bounds_candidate =
       laguna_expert_bounds_sidecar_candidate(indices_, M);
   const bool expert_bounds_sidecar =
@@ -1666,6 +1674,7 @@ void gather_qmm_rhs_nax(
   array indices = expert_bounds_sidecar
       ? indices_
       : ensure_row_contiguous(indices_, d, s);
+  array row_indices = ensure_row_contiguous(row_indices_, d, s);
 
   // Broadcast x with indices. If we are here that means lhs_indices were not
   // provided so the lhs_indices are implied to be the shape of x broadcasted
@@ -1685,7 +1694,9 @@ void gather_qmm_rhs_nax(
   };
 
   // Normalize the input arrays
-  array x = broadcast_with_indices(x_);
+  array x = row_addressed
+      ? ensure_row_contiguous(x_, d, s)
+      : broadcast_with_indices(x_);
   array w = ensure_row_contiguous(w_, d, s);
   // Laguna's certified packed decode scale bank is exposed to this prefill
   // primitive through a bounded shape-preserving view. Its exact expert shape,
@@ -1881,7 +1892,8 @@ void gather_qmm_rhs_nax(
           ? ("_eg_" + std::to_string(egroups) + (expert_widest ? "_ws_1" : "_ws_0") +
              (expert_wideld ? "_wl_1" : "_wl_0") +
              "_ps_" + std::to_string(expert_pairwise_scale_layout) +
-             (expert_bounds_sidecar ? "_eb_1" : "_eb_0"))
+             (expert_bounds_sidecar ? "_eb_1" : "_eb_0") +
+             (row_addressed ? "_ra_1" : "_ra_0"))
           : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
@@ -2042,6 +2054,9 @@ void gather_qmm_rhs_nax(
     array biases = ensure_row_contiguous(*biases_, d, s);
     compute_encoder.set_input_array(biases, c++);
   }
+  if (expert_aligned) {
+    compute_encoder.set_input_array(row_addressed ? row_indices : indices, c++);
+  }
   compute_encoder.set_input_array(indices, c++);
   compute_encoder.set_output_array(out, c++);
   compute_encoder.set_bytes(M, c++);
@@ -2057,6 +2072,7 @@ void gather_qmm_rhs(
     const array& w_,
     const array& scales_,
     const std::optional<array>& biases_,
+    const array& row_indices_,
     const array& indices_,
     array& out,
     bool transpose,
@@ -2067,7 +2083,8 @@ void gather_qmm_rhs(
     int K,
     metal::Device& d,
     const Stream& s,
-    const std::string mode) {
+    const std::string mode,
+    bool row_addressed) {
   if (metal::is_nax_available() && transpose &&
       (env::enable_tf32() || x_.dtype() != float32)) {
     return gather_qmm_rhs_nax(
@@ -2075,6 +2092,7 @@ void gather_qmm_rhs(
         /* const array& w_ = */ w_,
         /* const array& scales_ = */ scales_,
         /* const std::optional<array>& biases_ = */ biases_,
+        /* const array& row_indices_ = */ row_indices_,
         /* const array& indices_ = */ indices_,
         /* array& out = */ out,
         /* bool transpose = */ transpose,
@@ -2085,7 +2103,13 @@ void gather_qmm_rhs(
         /* int K = */ K,
         /* metal::Device& d = */ d,
         /* const Stream& s = */ s,
-        /* const std::string mode = */ mode);
+        /* const std::string mode = */ mode,
+        /* bool row_addressed = */ row_addressed);
+  }
+
+  if (row_addressed) {
+    throw std::runtime_error(
+        "[gather_qmm] row-addressed expert prefill requires the NAX path");
   }
 
   if (laguna_expert_bounds_sidecar_candidate(indices_, M)) {
@@ -2328,9 +2352,16 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
 
+  const bool row_addressed =
+      darkbloom_prefill_row_addressed() && !right_sorted_ && M == 1 &&
+      B >= 16 && B / E >= 4 && lhs_indices.dtype() == uint32 &&
+      lhs_indices.ndim() == 1 && lhs_indices.size() == B &&
+      x.size() / K * 8 == B &&
+      laguna_expert_bounds_sidecar_candidate(rhs_indices, B);
   const bool sorted_rhs =
-      M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4;
-  const int sorted_count = x.size() / K;
+      (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) ||
+      row_addressed;
+  const int sorted_count = row_addressed ? B : x.size() / K;
   const bool expert_bounds_candidate =
       laguna_expert_bounds_sidecar_candidate(rhs_indices, sorted_count);
   const bool expert_bounds_sidecar =
@@ -2373,17 +2404,19 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         w,
         scales,
         biases,
+        lhs_indices,
         rhs_indices,
         out,
         transpose_,
         group_size_,
         bits_,
-        x.size() / K,
+        sorted_count,
         N,
         K,
         d,
         s,
-        mode);
+        mode,
+        row_addressed);
     return;
   }
 
