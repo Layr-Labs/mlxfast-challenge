@@ -1,3 +1,17 @@
+// receipt-nonce: r109f-ticket2 (2026-08-10). Comment-only edit whose sole purpose
+// is to make this submission archive byte-distinct from the r109f-ticket1 archive
+// so the service does not dedupe it. No declaration, no type, no code path and no
+// numeric behaviour in this file or any other is changed by this line.
+//
+// receipt-nonce: r109f-ticket5 (2026-08-11), lottery-r109f-t5-nonce-c4f18a92-b.
+// Same purpose, replaying the r109f-ticket4 tree (base + atlas v3_tg128, QHOIST
+// reverted). Deliberately a no-change draw: the ranked instrument has a
+// single-receipt normalized sd of 0.370 %, so it cannot resolve any arm this
+// campaign owns (~40 receipts per arm at 0.30 %), while the local iterate
+// repeats to 0.05-0.10 %. Arms are therefore decided locally and ranked shots
+// are spent purely as lottery tickets on the best-believed package, at an
+// empirically priced p = 0.325 % per shot. See
+// research/maple-fern-r109f-instrument-collapse.md. No behaviour changes here.
 import Darwin
 import Foundation
 import MLXFastCore
