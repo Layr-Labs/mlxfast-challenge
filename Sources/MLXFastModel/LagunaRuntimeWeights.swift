@@ -651,12 +651,14 @@ public final class LagunaRuntimeWeightCache {
         try loader.validateRequiredMetadata(config: config)
         let model = LagunaRuntimeModel(config)
 
-        let loadedWeights = try loadRuntimeWeightArrays(denseStore: loader.denseStore)
-        let sanitized = model.sanitize(weights: loadedWeights)
-        // Poolside stores dense parameters in BF16 and NVFP4 scales in U8, so
-        // the library's fp16->bf16 conversion pass is a no-op and is omitted.
-        try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
-        eval(model)
+        // End the loader dictionaries' ownership before a replacement-only
+        // layout transaction; otherwise their references retain the old bank.
+        do {
+            let loadedWeights = try loadRuntimeWeightArrays(denseStore: loader.denseStore)
+            let sanitized = model.sanitize(weights: loadedWeights)
+            try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
+            eval(model)
+        }
         // Build the retained fused weight layouts (fused QKV, fused
         // shared-expert gate/up; see the DARKBLOOM_FUSED_* flags) from the
         // now-materialized checkpoint arrays, before the constructor-time
