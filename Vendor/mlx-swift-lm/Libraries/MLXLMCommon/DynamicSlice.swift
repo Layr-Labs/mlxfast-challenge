@@ -1,32 +1,8 @@
-// Dynamic slice operations with MLXArray start positions.
-//
-// These wrap the MLX C `slice_dynamic` / `slice_update_dynamic` primitives.
-// Unlike the Swift subscript (`src[from..<to]`) which bakes Int bounds into the
-// graph as constants, these take an `MLXArray` start position so the `compile()`
-// tracer can track it through the computation graph. This is what makes
-// fixed-size, compile-traceable KV caches (see ``CompilableKVCache``) possible.
-//
-// Ported from osaurus-ai/vmlx-swift-lm (Libraries/MLXLMCommon/DynamicSlice.swift).
-// The underlying `mlx_slice_dynamic` / `mlx_slice_update_dynamic` C entry points
-// already ship in the Layr-Labs mlx-swift Cmlx target.
 
 import Cmlx
 import Foundation
 import MLX
 
-/// Read a slice of `src` starting at dynamic `start` positions on given `axes`.
-///
-/// Unlike the subscript `src[from..<to]` which uses Int indices (baked into
-/// the graph as constants), this takes an MLXArray start position so the
-/// compile tracer can track it through the graph.
-///
-/// - Parameters:
-///   - src: Source array
-///   - start: MLXArray with start indices (one per axis in `axes`)
-///   - axes: Which axes to slice along
-///   - sliceSize: Size of the slice on each axis
-///   - stream: Stream for the operation
-/// - Returns: Sliced array
 public func dynamicSlice(
     _ src: MLXArray,
     start: MLXArray,
@@ -34,8 +10,6 @@ public func dynamicSlice(
     sliceSize: [Int32],
     stream: StreamOrDevice = .default
 ) -> MLXArray {
-    // Use the C-level slice(array, array_start, axes, slice_size) overload.
-    // This creates a DynamicSlice primitive which has output_shapes support.
     var result = mlx_array_new()
     var axesInt = axes.map { Int32($0) }
     var sizes = sliceSize.map { Int32($0) }
@@ -54,11 +28,6 @@ public func dynamicSlice(
     return MLXArray(result)
 }
 
-/// Update a slice of `src` at dynamic `start` positions on given `axes`.
-///
-/// Returns a new array equal to `src` with `update` written in at `start`.
-/// Used by ``CompilableKVCache`` to write new KV tokens into a fixed-size
-/// buffer inside a compiled graph.
 public func dynamicSliceUpdate(
     _ src: MLXArray,
     update: MLXArray,
