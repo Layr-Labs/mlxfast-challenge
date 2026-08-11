@@ -1,3 +1,13 @@
+// Maple campaign - advisor receipt nonce `maple-advisor-r120-01`.
+//
+// Comment-only marker so this HEAD-class replay receipt can be
+// attributed to exactly one submitted tree when the channel history
+// is read back. No executable statement, declaration, constant,
+// build flag or kernel source is changed, and no kernel is renamed
+// (MLX caches compiled Metal libraries by kernel name, so renames
+// are never free). This draw makes no performance claim.
+// Drawn 2026-08-11T07:25:34Z.
+
 import Darwin
 import Foundation
 import MLXFastCore
