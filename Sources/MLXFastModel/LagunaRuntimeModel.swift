@@ -19,12 +19,6 @@ func lagunaLastTokenHidden(_ hidden: MLXArray) -> MLXArray {
 }
 
 // MARK: - Allocation-free shape checks
-//
-// `MLXArray.shape` builds a fresh Swift `[Int]` and comparing it against a
-// dimension literal builds a second one, so each such guard on the decode path
-// costs two heap allocations. `ndim` and `shapeN` are direct C accessors that
-// allocate nothing, and the `ndim` test short-circuits `shapeN`'s
-// dimensionality precondition.
 
 extension MLXArray {
     /// True when the shape is exactly the listed dimensions.
@@ -48,13 +42,7 @@ extension MLXArray {
     }
 }
 
-/// Builds the `initializeRope` scaling dictionary for a per-type Laguna RoPE
-/// spec. For `default` RoPE only the type is consulted; for YaRN the factory
-/// reads factor / original context / betas. The XS config also serializes
-/// `attention_factor: 1.0`, but both vendored MLX Laguna implementations
-/// intentionally ignore that Hugging Face field. Do not forward it here:
-/// leaving MLX's mscale/mscale_all_dim defaults at 1.0/0.0 yields the upstream
-/// attention scaling of `0.1 * ln(32) + 1` (~1.34657).
+/// Builds the upstream-compatible default/YaRN RoPE scaling dictionary.
 func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber] {
     var scalingConfig: [String: StringOrNumber] = ["rope_type": .string(spec.type)]
     if spec.type == "yarn" {
@@ -67,11 +55,7 @@ func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber]
     return scalingConfig
 }
 
-/// `DARKBLOOM_TRACE_FUSION=1` prints one stderr line the first time each fused
-/// decode path is taken. Every fusion here is guarded on dtype, rank, exact
-/// shape and module identity and falls back silently when a guard declines, so
-/// a change that quietly stops firing looks exactly like a change that does
-/// nothing. This makes "did it actually run" observable without a debugger.
+/// `DARKBLOOM_TRACE_FUSION=1` reports each guarded fusion once.
 private let lagunaTraceFusion =
     ProcessInfo.processInfo.environment["DARKBLOOM_TRACE_FUSION"] == "1"
 private let lagunaTracedFusions = LagunaFusionTraceLog()
@@ -98,83 +82,39 @@ func lagunaTrace(_ site: @autoclosure () -> String) {
 
 // MARK: - Runtime fusion feature flags
 
-// Each fusion below concatenates the OUTPUT ROWS of same-dtype projections
-// that consume the same input. Per-row gemv/qmv/gather-qmv arithmetic is
-// independent of which rows share a dispatch (every output row keeps its own
-// K-loop and scale application in the original order), so the fused dispatch
-// is bit-exact against the separate dispatches it replaces. The per-head
-// g_proj (N=64) uses a different split-K gemv variant and is never fused.
-
-/// `DARKBLOOM_FUSED_QKV` (default OFF; set "1" to enable): after checkpoint
-/// load, retain one row-concatenated `[Wq; Wk; Wv]` BF16 weight per attention
-/// layer and serve Q/K/V from a single projection dispatch. Ablation on the
-/// paired local benchmark showed a mild prefill cost with no decode gain, so
-/// this ships opt-in.
+/// Opt-in row-concatenated BF16 Q/K/V projection.
 let lagunaFusedQKVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
 
-/// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
-/// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
-/// shared expert and serve single-token decode from one quantized matmul.
-/// Multi-token prefill remains on the stock separate banks so the ranked
-/// prefill path and its smaller gather/GEMM shapes are unchanged.
+/// Default-on shared-expert gate/up decode fusion.
 let lagunaFusedSharedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
 
-/// Decode-only shared-expert NVFP4 QMV + SwiGLU fusion. This consumes the
-/// retained row-concatenated `[gate; up]` bank and emits only the 512-wide
-/// BF16 activation, preserving the two independent QMV casts and every BF16
-/// boundary in the compiled SiLU product.
+/// Decode-only shared-expert NVFP4 QMV + SwiGLU fusion.
 let lagunaFusedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_SWIGLU_QMV"] != "0"
 
-/// Decode-only shared-expert down QMV plus both sparse-block residual adds.
-/// The kernel preserves the stock BF16 down-projection result, the inner
-/// `routed + shared` rounding, and the outer `h + r2` rounding while avoiding
-/// the intermediate shared/r2 materializations and the final elementwise
-/// dispatch.
+/// Decode-only shared down-QMV and residual fusion.
 let lagunaFusedSharedDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_DOWN_RESIDUAL"] != "0"
 
-/// Higher-fusion decode path: the eight routed down projections and the
-/// shared down projection share one 288-thread dispatch, which also performs
-/// the exact router reduction, routed scale, and both BF16 residual adds.
+/// Decode routed/shared down projection and residual fusion.
 let lagunaFusedRoutedSharedDownResidualEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_DOWN_RESIDUAL"] != "0"
 
-/// Routed-expert counterpart to the shared QMV + SwiGLU fusion. Each decode
-/// request supplies exactly eight current-token expert indices; the kernel
-/// reads those banks directly and emits `[1, 1, 8, 1, 512]`.
+/// Decode-only routed QMV + SwiGLU fusion.
 let lagunaFusedRoutedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_SWIGLU_QMV"] != "0"
 
-/// `DARKBLOOM_PACKED_SCALES` (default ON; set "0" to disable): decode-only
-/// scale-interleaved side copy of the fused routed gate/up NVFP4 bank. The
-/// stock `lagunaRoutedSwiGLUQMV` reads codes and E4M3 scales from two separate
-/// tensors (four device streams per simdgroup iteration: gate codes, up
-/// codes, gate scales, up scales). The packed side bank stores only the 32
-/// scale bytes for each row and K block, in the kernel's exact walk order
-/// `[expert][tile 128][k-block 4][row-pair sub 8]`; the resident fused code
-/// bank is reused directly. Load widths, dequant expressions, accumulation
-/// order, and every BF16 boundary are identical to the stock kernel — only
-/// scale address computation changes, so the packed dispatch is bit-exact
-/// (class A).
-/// Memory: +~16 MiB resident per sparse layer while enabled (the stock fused
-/// code bank stays resident for prefill and fallback paths).
+/// Default-on decode walk-order scale side bank; zero restores full scales.
 let lagunaPackedScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
 
-/// Publish exact corrected router ordinals from the existing fused producer
-/// so routed QMV consumers avoid repeating the nonlinear key construction.
-/// The OFF arm restores the promoted selector dependency exactly.
+/// Reuse exact router ordinals from the fused producer.
 private let lagunaRouterPrecomputedKeysEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_PRECOMPUTED_KEYS"] != "0"
 
-/// One-shot stderr visibility for the packed-scales arm: with the flag set,
-/// the arm MUST announce either "active" (bank built / packed dispatch taken)
-/// or "inactive" (a guard declined and the stock kernel ran instead), so a
-/// silently-declining guard can never measure its own control.
 final class LagunaPackedScalesLog: @unchecked Sendable {
     private var seen: Set<String> = []
     private let lock = NSLock()
@@ -192,46 +132,33 @@ final class LagunaPackedScalesLog: @unchecked Sendable {
 
 let lagunaPackedScalesLog = LagunaPackedScalesLog()
 
-/// Decode-only routed NVFP4 down-QMV plus BF16 router weighting, fixed-order
-/// expert reduction, and the Laguna 2.5 routed scale. The custom kernel emits
-/// one 2048-wide branch instead of materializing eight expert rows.
+/// Decode routed down-QMV, weighting, and reduction fusion.
 let lagunaFusedRoutedDownReduceEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_DOWN_REDUCE"] != "0"
 
-/// `DARKBLOOM_FUSED_ROUTED_GATE_UP` (default on; set "0" to disable): after
-/// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
-/// sparse layer's routed experts and serve single-token decode's gate/up from
-/// one gather-QMM dispatch. DECODE-ONLY: the module tree, checkpoint keys,
-/// and every multi-token (prefill) forward stay fully stock -- ablation
-/// showed the fused bank helps decode (~+1.9%) but badly hurts the M=512
-/// sorted gather-GEMM prefill path, so prefill always dispatches the stock
-/// separate banks.
-///
-/// That prefill finding pre-dates RUNSKIP. See
-/// `DARKBLOOM_PREFILL_FUSED_GATE_UP` immediately below for the current,
-/// separately-flagged, post-RUNSKIP re-measurement of the same fusion idea
-/// applied to the sorted prefill path -- this flag and its history are left
-/// as-is (decode-only) rather than folded together, so each can be ablated
-/// independently.
+/// Default-on row-concatenated routed gate/up decode bank.
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
 
-/// Multi-token sorted gather-GEMM counterpart to the decode gate/up fusion;
-/// independently ablatable and row-arithmetic-identical to separate banks.
+/// Default-on sorted-prefill routed gate/up fusion.
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
-/// Exact prefill-only reuse of the certified packed decode scale bank by the
-/// expert-aligned NAX path. Setting the flag to zero keeps the stock fused
-/// scale plane and backend specialization.
+/// Exact prefill reuse of the packed decode scale bank.
 let lagunaPrefillExpertPairwiseScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_PAIRWISE_SCALES"] != "0"
 
-/// Producer-supplied exact expert prefixes for the two fused sorted routed
-/// prefill QMMs. The sorter and consumer identities encode the selected arm;
-/// zero restores the ordinary sorted-key payload exactly.
+/// Exact expert prefixes published by the fused route sorter.
 let lagunaExpertBoundsSidecarEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_EXPERT_BOUNDS_SIDECAR"] != "0"
+
+/// Default-on prefill path. The fused sorter publishes only its stable row
+/// order and exact expert prefixes; the expert NAX gate/up loader resolves
+/// those rows against the original BF16 hidden-state bank instead of
+/// materializing and rereading a 16 MiB sorted copy. Set
+/// `DARKBLOOM_PREFILL_ROW_ADDRESSED=0` for the process-level rollback.
+let lagunaPrefillRowAddressedEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_ROW_ADDRESSED"] != "0"
 
 // Independent DawgZter N1 persistence receipt; executable behavior is unchanged.
 // Independent fifth-slot continuation; executable behavior remains identical.
@@ -10376,17 +10303,8 @@ private func lagunaInterleavedSwiGLU(
     return compiledSiluProduct(gate, up)
 }
 
-/// Prefill (multi-token, SORTED-regime) counterpart to the decode-only fused
-/// gate/up dispatch in `LagunaRuntimeSparseMoEBlock.forward`. One gather-QMM
-/// consumes the retained `[gate32, up32]`-interleaved NVFP4 bank in place of
-/// `SwitchGLU`'s separate `gate_proj` and `up_proj` calls. On the ranked
-/// expert-aligned path the backend also applies the same rounded-BF16 SiLU
-/// product and packs the 512-wide activation into the first half of the
-/// nominal 1024-wide output allocation, avoiding that intermediate's device
-/// round trip. Sorting and unsorting remain the stock calls. The down
-/// projection also remains argument-for-argument stock unless the separately
-/// certified zero-copy down-scale marker is present, in which case the same
-/// `gatherQuantizedMM` call is issued directly with that marker.
+/// Sorted prefill over the retained interleaved gate/up bank. Sorting, BF16
+/// SwiGLU semantics, down projection, and unsorting remain stock-equivalent.
 private func lagunaFusedSortedRoutedGateUp(
     _ x: MLXArray,
     indices: MLXArray,
@@ -10399,51 +10317,43 @@ private func lagunaFusedSortedRoutedGateUp(
     downPairwiseScales: MLXArray?,
     deferUnsort: Bool
 ) -> (output: MLXArray, inverseOrder: MLXArray?) {
-    // SwitchGLU: `var x = MLX.expandedDimensions(x, axes: [-2, -3])`
     var sortedX = MLX.expandedDimensions(x, axes: [-2, -3])
-    // SwitchGLU: `let doSort = indices.size >= 64`. The call site already
-    // guards `indices.size >= 64` before calling in, so this is always true
-    // here; recomputed anyway so this function mirrors SwitchGLU verbatim
-    // and stays correct if that guard is ever loosened.
     let doSort = indices.size >= 64
-    // SwitchGLU: `var idx = indices` / `var inverseOrder = MLXArray()`
     var idx = indices
     var inverseOrder = MLXArray()
-    // SwitchGLU: `if doSort { (x, idx, inverseOrder) = gatherSort(x: x, indices: indices) }`
-    //
+    var rowOrder: MLXArray?
     if doSort {
-        // N1: only this dedicated fused routed-prefill chain requests the
-        // exact 257-entry expert-bounds payload. The same zero-stride-marked idx
-        // view flows unchanged through both fused gate/up and down QMMs.
-        // `=0` is the exact control and restores ordinary sorted keys.
-        (sortedX, idx, inverseOrder) = gatherSort(
-            x: sortedX,
-            indices: indices,
-            expertBoundsSidecar: lagunaExpertBoundsSidecarEnabled
-                && lagunaExpertAlignedGatherEnabled
-                && pairwiseScales != nil
-                && downWeight != nil
-                && downPairwiseScales != nil
-                && lagunaPrefillExpertPairwiseScalesAdmitted(
-                    routedRows: indices.size)
-        )
+        // Only the fused route-sort producer may publish the bounds marker.
+        let useExpertBounds = lagunaExpertBoundsSidecarEnabled
+            && lagunaExpertAlignedGatherEnabled
+            && pairwiseScales != nil
+            && downWeight != nil
+            && downPairwiseScales != nil
+            && lagunaPrefillExpertPairwiseScalesAdmitted(
+                routedRows: indices.size)
+        let useRowAddressed = lagunaPrefillRowAddressedEnabled
+            && useExpertBounds
+            && gatherSortMetadataSupportsExpertBounds(indices: indices)
+        if useRowAddressed {
+            let metadata = gatherSortMetadata(
+                indices: indices,
+                expertBoundsSidecar: true)
+            rowOrder = metadata.rowOrder
+            idx = metadata.sortedKeys
+            inverseOrder = metadata.inverseOrder
+        } else {
+            (sortedX, idx, inverseOrder) = gatherSort(
+                x: sortedX,
+                indices: indices,
+                expertBoundsSidecar: useExpertBounds)
+        }
     }
-    // Fused counterpart of SwitchGLU's separate-bank branch:
-    //   xUp = upProj(x, idx, sortedIndices: doSort)
-    //   xGate = gateProj(x, idx, sortedIndices: doSort)
-    // Each of those is exactly `QuantizedSwitchLinear.callAsFunction` with
-    // `biases: nil` (both banks are bias-free per the `prepareFusedRoutedGateUp`
-    // guard): `MLX.gatherQuantizedMM(x, weight, scales: scales, biases: nil,
-    // rhsIndices: indices, transpose: true, groupSize: groupSize, bits: bits,
-    // mode: mode, sortedIndices: sortedIndices)`. Issuing that once over the
-    // tile-interleaved `fusedWeight`/`fusedScales` bank instead of twice over
-    // the separate banks is the fusion; every other argument matches the
-    // stock call exactly (group 16, 4-bit, NVFP4, transpose, doSort).
     let gateUp = MLX.gatherQuantizedMM(
         sortedX,
         fusedWeight,
         scales: pairwiseScales ?? fusedScales,
         biases: nil,
+        lhsIndices: rowOrder,
         rhsIndices: idx,
         transpose: true,
         groupSize: 16,
@@ -10453,9 +10363,7 @@ private func lagunaFusedSortedRoutedGateUp(
     )
     let activated: MLXArray
     if lagunaExpertAlignedGatherEnabled {
-        // The expert kernel writes rows with a physical stride of `split`
-        // into the allocation's contiguous prefix. Slice that prefix before
-        // restoring the logical shape expected by down_proj.
+        // Expert NAX writes the packed activation into the allocation prefix.
         var activatedShape = gateUp.shape
         activatedShape[activatedShape.count - 1] = split
         activated = gateUp.reshaped([-1])[0 ..< gateUp.size / 2]
@@ -10463,10 +10371,6 @@ private func lagunaFusedSortedRoutedGateUp(
     } else {
         activated = lagunaInterleavedSwiGLU(gateUp, split: split)
     }
-    // SwitchGLU: `x = downProj(activated, idx, sortedIndices: doSort)`.
-    // The direct form is argument-for-argument identical, but permits the M5
-    // backend to consume the certified zero-copy row-major down scale marker.
-    // If either retained array is absent, keep the exact stock module call.
     var result: MLXArray
     if let downWeight, let downPairwiseScales {
         result = MLX.gatherQuantizedMM(
@@ -10484,14 +10388,12 @@ private func lagunaFusedSortedRoutedGateUp(
     } else {
         result = downProj(activated, idx, sortedIndices: doSort)
     }
-    // SwitchGLU: `if doSort { x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape) }`
     if doSort && !deferUnsort {
         result = scatterUnsort(x: result, invOrder: inverseOrder, shape: indices.shape)
     }
     if doSort && deferUnsort {
         return (result, inverseOrder)
     }
-    // SwitchGLU: `return MLX.squeezed(x, axis: -2)`
     return (MLX.squeezed(result, axis: -2), nil)
 }
 
@@ -10502,46 +10404,21 @@ final class LagunaRuntimeSparseMoEBlock: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaRuntimeMLP
 
-    /// Retained fused NVFP4 `[gate32, up32]` routed-expert banks (per-expert
-    /// output rows interleaved in matched 32-row tiles), built once after
-    /// checkpoint load when `DARKBLOOM_FUSED_ROUTED_GATE_UP` is enabled, plus
-    /// a reference to the stock `switch_mlp.down_proj` module for the fused
-    /// decode path. Plain stored properties with a leading underscore so
-    /// Module reflection never treats the derived layout as checkpoint
-    /// parameters or a second child module; `switchMLP` keeps the original
-    /// separate banks for checkpoint parameter integrity.
+    /// Derived interleaved routed banks; leading underscores exclude them from
+    /// Module checkpoint reflection.
     var _fusedRoutedGateUpWeight: MLXArray?
     var _fusedRoutedGateUpScales: MLXArray?
-    /// Shape-preserving marker view over the existing packed decode scale bank
-    /// for the M5 expert prefill NAX loader. It owns no storage.
     var _fusedRoutedGateUpPairwiseScales: MLXArray?
     var _fusedRoutedGateUpSplit: Int = 0
     var _routedDownProj: SwitchLinear?
     var _routedDownWeight: MLXArray?
-    /// Group-32 halved routed `down_proj` scale plane (see
-    /// `lagunaHalvedGroup32ScalePlane`): a patch header followed by
-    /// `experts * hiddenSize * (moeIntermediateSize / 32)` bytes. Nil when
-    /// the halved plane would not be bitwise lossless, in which case the
-    /// down projection falls back to the stock module.
+    /// Lossless group-32 routed down-scale plane, or nil for stock fallback.
     var _routedDownScales: MLXArray?
-    /// Shape-preserving marker view over `_routedDownScales` for the M5
-    /// expert-aligned prefill down projection. It owns no storage.
     var _routedDownPairwiseScales: MLXArray?
-    /// `DARKBLOOM_PACKED_SCALES` walk-order scale-interleaved copy of the
-    /// fused routed gate/up scales, group-32 halved and prefixed with the
-    /// patch header; see `lagunaRoutedSwiGLUQMVPackedKernel` for the layout
-    /// contract. Nil when the flag is set to zero (default ON) and whenever
-    /// the halved plane would not be bit-exact, in which case the routed QMV
-    /// path reads the full fused scales instead.
+    /// Walk-order packed gate/up bank, or nil for the full-scale fallback.
     var _packedRoutedGateUpBank: MLXArray?
 
-    /// Builds and retains the fused routed gate/up NVFP4 banks from the
-    /// loaded stock `SwitchGLU` submodules (reached through the public
-    /// `children()`/`parameters()` Module APIs). Called once after weights
-    /// are installed and evaluated (before warmup); returns the new arrays
-    /// so the caller can batch a single eval. Fuses only the exact stock
-    /// configuration: two bias-free NVFP4 group-16 4-bit
-    /// `QuantizedSwitchLinear` banks with identical packed shapes.
+    /// Builds exact bias-free NVFP4 group-16 fused routed banks after load.
     func prepareFusedRoutedGateUp() -> [MLXArray] {
         guard _fusedRoutedGateUpWeight == nil, _fusedRoutedGateUpScales == nil else {
             return []
