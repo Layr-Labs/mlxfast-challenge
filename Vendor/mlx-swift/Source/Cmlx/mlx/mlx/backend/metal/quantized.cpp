@@ -1362,8 +1362,8 @@ bool darkbloom_expert_stage_wideld() {
   return v;
 }
 
-// DARKBLOOM_EXPERT_GATHER_GROUPS (default 128; "64" restores the promoted
-// four-experts-per-threadgroup schedule and "256" selects one expert per
+// DARKBLOOM_EXPERT_GATHER_GROUPS (default 256; "64" restores the historical
+// four-experts-per-threadgroup schedule and "128" selects two experts per
 // threadgroup, both kept as A/B controls): how many threadgroups the
 // expert-aligned gather QMM spreads the 256 experts over. More threadgroups
 // means the hardware scheduler overlaps per-expert staging drains and MMA
@@ -1371,11 +1371,9 @@ bool darkbloom_expert_stage_wideld() {
 // the threadgroup-to-expert assignment changes: every output element is
 // computed by the same tile walk with the same accumulation order, and the
 // value is baked into the kernel name and template, so each setting compiles
-// exactly one pipeline for the process lifetime. Measured on M5 Max against
-// the promoted 64 schedule, 128 captures roughly two-thirds of the 256
-// schedule's prefill gain while keeping the measured speedup comfortably
-// mid-band; 256 measures closer to the acceptance ceiling in the single-shot
-// harness regime and is staged as its own follow-up chunk.
+// exactly one pipeline for the process lifetime. The shipped no-override arm
+// is therefore EG256 x one expert slot; older 64/128 descriptions are controls,
+// not the current baseline.
 int darkbloom_expert_gather_groups() {
   static const int v = [] {
     auto s = env::get_var("DARKBLOOM_EXPERT_GATHER_GROUPS", "");
@@ -1613,6 +1611,30 @@ int laguna_expert_pairwise_scale_layout(const array& scales) {
   return 0;
 }
 
+// Structural marker for N1's producer-supplied expert bounds. The dedicated
+// Laguna sorter allocates M+16 uint32 words and returns an M-word zero-stride
+// view at byte offset 64. Generic MLX semantics see one repeated element;
+// only the exact Laguna NAX specialization deliberately walks the contiguous
+// backing words. This mirrors the certified pairwise-scale storage marker and
+// cannot collide with an ordinary contiguous offset-64 slice.
+bool laguna_expert_bounds_sidecar_candidate(const array& indices, int M) {
+  static const bool enabled =
+      env::get_var("DARKBLOOM_EXPERT_BOUNDS_SIDECAR", "") != "0";
+  return enabled && indices.offset() == 64 && indices.dtype() == uint32 &&
+      indices.ndim() == 1 && indices.shape(0) == M && indices.size() == M &&
+      indices.strides().size() == 1 && M > 256 &&
+      M % 128 == 0 && indices.strides()[0] == 0;
+}
+
+bool laguna_expert_bounds_sidecar_storage(const array& indices, int M) {
+  return laguna_expert_bounds_sidecar_candidate(indices, M) &&
+      indices.data_size() == 1 &&
+      indices.nbytes() == size_t(M) * sizeof(uint32_t) &&
+      indices.buffer_size() >= (size_t(M) + 16) * sizeof(uint32_t) &&
+      indices.flags().contiguous && !indices.flags().row_contiguous &&
+      !indices.flags().col_contiguous;
+}
+
 void gather_qmm_rhs_nax(
     const array& x_,
     const array& w_,
@@ -1629,8 +1651,21 @@ void gather_qmm_rhs_nax(
     metal::Device& d,
     const Stream& s,
     const std::string mode) {
-  // Start by normalizing the indices
-  array indices = ensure_row_contiguous(indices_, d, s);
+  const bool expert_bounds_candidate =
+      laguna_expert_bounds_sidecar_candidate(indices_, M);
+  const bool expert_bounds_sidecar =
+      laguna_expert_bounds_sidecar_storage(indices_, M);
+  if (expert_bounds_candidate && !expert_bounds_sidecar) {
+    throw std::runtime_error(
+        "[gather_qmm] malformed Laguna expert-bounds sidecar storage");
+  }
+
+  // Preserve the certified zero-stride sidecar. Normalizing it would expand
+  // the first prefix word M times and destroy the contiguous backing payload.
+  // Every ordinary index array retains the stock normalization path.
+  array indices = expert_bounds_sidecar
+      ? indices_
+      : ensure_row_contiguous(indices_, d, s);
 
   // Broadcast x with indices. If we are here that means lhs_indices were not
   // provided so the lhs_indices are implied to be the shape of x broadcasted
@@ -1704,6 +1739,35 @@ void gather_qmm_rhs_nax(
   if (pairwise_scale_layout != 0 && expert_pairwise_scale_layout == 0) {
     throw std::runtime_error(
         "[gather_qmm] Laguna pairwise scale marker reached a non-expert path");
+  }
+  if (expert_bounds_sidecar &&
+      (!expert_aligned || mode != "nvfp4" || biases_.has_value() ||
+       expert_pairwise_scale_layout == 0)) {
+    throw std::runtime_error(
+        "[gather_qmm] Laguna expert-bounds sidecar reached a non-expert path");
+  }
+  if (expert_aligned && expert_pairwise_scale_layout != 0 &&
+      darkbloom_stage_flag("DARKBLOOM_STAGE_TRACE")) {
+    static std::once_flag eb_once[4];
+    const int eb_trace_slot = 2 * (expert_pairwise_scale_layout - 1) +
+        (expert_bounds_sidecar ? 1 : 0);
+    std::call_once(eb_once[eb_trace_slot], [&]() {
+      fprintf(
+          stderr,
+          "mlxfast: expert bounds path: eb=%d ps=%d offset=%zu stride=%lld "
+          "data=%zu flags=%d/%d/%d N=%d K=%d M=%d\n",
+          int(expert_bounds_sidecar),
+          expert_pairwise_scale_layout,
+          size_t(indices.offset()),
+          static_cast<long long>(indices.strides()[0]),
+          indices.data_size(),
+          int(indices.flags().contiguous),
+          int(indices.flags().row_contiguous),
+          int(indices.flags().col_contiguous),
+          N,
+          K,
+          M);
+    });
   }
   std::string type_string = get_type_string(x.dtype());
   static const bool static_laguna_shapes =
@@ -1816,7 +1880,8 @@ void gather_qmm_rhs_nax(
       expert_aligned
           ? ("_eg_" + std::to_string(egroups) + (expert_widest ? "_ws_1" : "_ws_0") +
              (expert_wideld ? "_wl_1" : "_wl_0") +
-             "_ps_" + std::to_string(expert_pairwise_scale_layout))
+             "_ps_" + std::to_string(expert_pairwise_scale_layout) +
+             (expert_bounds_sidecar ? "_eb_1" : "_eb_0"))
           : "");
 
   // Skipping dead runs is a pure work elision (see function constant 203 in
@@ -2021,6 +2086,11 @@ void gather_qmm_rhs(
         /* metal::Device& d = */ d,
         /* const Stream& s = */ s,
         /* const std::string mode = */ mode);
+  }
+
+  if (laguna_expert_bounds_sidecar_candidate(indices_, M)) {
+    throw std::runtime_error(
+        "[gather_qmm] Laguna expert-bounds sidecar requires the NAX path");
   }
 
   // Start by normalizing the indices
@@ -2260,6 +2330,27 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   const bool sorted_rhs =
       M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4;
+  const int sorted_count = x.size() / K;
+  const bool expert_bounds_candidate =
+      laguna_expert_bounds_sidecar_candidate(rhs_indices, sorted_count);
+  const bool expert_bounds_sidecar =
+      laguna_expert_bounds_sidecar_storage(rhs_indices, sorted_count);
+  if (expert_bounds_candidate && !expert_bounds_sidecar) {
+    throw std::runtime_error(
+        "[gather_qmm] malformed Laguna expert-bounds sidecar storage");
+  }
+  const bool expert_bounds_outer_contract =
+      expert_bounds_sidecar && sorted_rhs && metal::is_nax_available() &&
+      transpose_ && group_size_ == 16 && bits_ == 4 && mode == "nvfp4" &&
+      !biases.has_value() && x.dtype() == bfloat16 && E == 256 &&
+      darkbloom_expert_aligned_gather() &&
+      ((pairwise_scale_layout == 1 && K == 2048 && N == 1024) ||
+       (pairwise_scale_layout == 2 && K == 512 && N == 2048));
+  if (expert_bounds_sidecar && !expert_bounds_outer_contract) {
+    throw std::runtime_error(
+        "[gather_qmm] Laguna expert-bounds sidecar reached an unsupported "
+        "outer dispatch");
+  }
   const bool pairwise_contract =
       sorted_rhs && metal::is_nax_available() && transpose_ &&
       group_size_ == 16 && bits_ == 4 && mode == "nvfp4" &&

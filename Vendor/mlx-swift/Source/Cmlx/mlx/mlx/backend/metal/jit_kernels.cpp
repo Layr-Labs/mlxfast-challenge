@@ -1222,6 +1222,26 @@ const char* darkbloom_bsearch_hoist_define() {
   return define;
 }
 
+// N1 producer-supplied exact expert bounds. Unlike the process-wide staging
+// levers, this specialization is selected by the validated structural marker
+// on the actual indices array, then encoded as `_eb_1` in the library name.
+// Deriving the define from that identity keeps eb0 and eb1 pipelines coherent
+// even if both are warmed in the same process.
+std::string darkbloom_expert_bounds_sidecar_define(
+    const std::string& kernel_name) {
+  const bool enabled = kernel_name.find("_eb_1") != std::string::npos;
+  if (env::get_var("DARKBLOOM_TRACE_FUSION", "") == "1") {
+    fprintf(
+        stderr,
+        "mlxfast: fusion %s: expert_bounds_sidecar "
+        "(expert gather-QMM JIT source)\n",
+        enabled ? "active" : "inactive");
+  }
+  return enabled
+      ? "\n#define DARKBLOOM_EXPERT_BOUNDS_SIDECAR 1\n"
+      : std::string();
+}
+
 } // namespace
 
 MTL::ComputePipelineState* get_qmm_nax_kernel(
@@ -1246,6 +1266,9 @@ MTL::ComputePipelineState* get_qmm_nax_kernel(
             : "",
         (kernel_name.find("_expert_") != std::string::npos)
             ? darkbloom_bsearch_hoist_define()
+            : "",
+        (kernel_name.find("_expert_") != std::string::npos)
+            ? darkbloom_expert_bounds_sidecar_define(kernel_name)
             : "",
         metal::gemm_nax(),
         metal::quantized_utils(),
