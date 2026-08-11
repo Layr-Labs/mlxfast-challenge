@@ -89,7 +89,6 @@ instantiate_binary_types(Power)
 instantiate_binary_types(Remainder)
 instantiate_binary_float(ArcTan2)
 
-// NaNEqual only needed for floating point types with boolean output
 instantiate_binary_all(NaNEqual, float16, half, bool)
 instantiate_binary_all(NaNEqual, float32, float, bool)
 instantiate_binary_all(NaNEqual, bfloat16, bfloat16_t, bool)
@@ -98,7 +97,6 @@ instantiate_binary_base(NaNEqual, complex64, complex64_t, bool)
 instantiate_binary_all(LogicalOr, bool_, bool, bool)
 instantiate_binary_all(LogicalAnd, bool_, bool, bool)
 
-// Bitwise ops only need integer types and bool (except for l/r shift)
 instantiate_binary_integer(BitwiseAnd)
 instantiate_binary_all(BitwiseAnd, bool_, bool, bool)
 instantiate_binary_integer(BitwiseOr)
