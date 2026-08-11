@@ -4,8 +4,6 @@ import MLXFast
 import MLXLMCommon
 import MLXNN
 
-// Correctness-first Laguna XS 2.1 runtime, behavior-checked against the
-// vendored reference implementation and specialized by guarded fast paths.
 
 func lagunaLastTokenRange(sequenceLength: Int) -> Range<Int>? {
     sequenceLength > 1 ? (sequenceLength - 1)..<sequenceLength : nil
@@ -18,13 +16,6 @@ func lagunaLastTokenHidden(_ hidden: MLXArray) -> MLXArray {
     return hidden[0..., range, 0...]
 }
 
-// MARK: - Allocation-free shape checks
-//
-// `MLXArray.shape` builds a fresh Swift `[Int]` and comparing it against a
-// dimension literal builds a second one, so each such guard on the decode path
-// costs two heap allocations. `ndim` and `shapeN` are direct C accessors that
-// allocate nothing, and the `ndim` test short-circuits `shapeN`'s
-// dimensionality precondition.
 
 extension MLXArray {
     /// True when the shape is exactly the listed dimensions.
@@ -48,13 +39,6 @@ extension MLXArray {
     }
 }
 
-/// Builds the `initializeRope` scaling dictionary for a per-type Laguna RoPE
-/// spec. For `default` RoPE only the type is consulted; for YaRN the factory
-/// reads factor / original context / betas. The XS config also serializes
-/// `attention_factor: 1.0`, but both vendored MLX Laguna implementations
-/// intentionally ignore that Hugging Face field. Do not forward it here:
-/// leaving MLX's mscale/mscale_all_dim defaults at 1.0/0.0 yields the upstream
-/// attention scaling of `0.1 * ln(32) + 1` (~1.34657).
 func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber] {
     var scalingConfig: [String: StringOrNumber] = ["rope_type": .string(spec.type)]
     if spec.type == "yarn" {
@@ -67,11 +51,6 @@ func lagunaRopeScalingConfig(_ spec: LagunaRopeSpec) -> [String: StringOrNumber]
     return scalingConfig
 }
 
-/// `DARKBLOOM_TRACE_FUSION=1` prints one stderr line the first time each fused
-/// decode path is taken. Every fusion here is guarded on dtype, rank, exact
-/// shape and module identity and falls back silently when a guard declines, so
-/// a change that quietly stops firing looks exactly like a change that does
-/// nothing. This makes "did it actually run" observable without a debugger.
 private let lagunaTraceFusion =
     ProcessInfo.processInfo.environment["DARKBLOOM_TRACE_FUSION"] == "1"
 private let lagunaTracedFusions = LagunaFusionTraceLog()
@@ -96,85 +75,33 @@ func lagunaTrace(_ site: @autoclosure () -> String) {
     lagunaTracedFusions.note(site())
 }
 
-// MARK: - Runtime fusion feature flags
 
-// Each fusion below concatenates the OUTPUT ROWS of same-dtype projections
-// that consume the same input. Per-row gemv/qmv/gather-qmv arithmetic is
-// independent of which rows share a dispatch (every output row keeps its own
-// K-loop and scale application in the original order), so the fused dispatch
-// is bit-exact against the separate dispatches it replaces. The per-head
-// g_proj (N=64) uses a different split-K gemv variant and is never fused.
 
-/// `DARKBLOOM_FUSED_QKV` (default OFF; set "1" to enable): after checkpoint
-/// load, retain one row-concatenated `[Wq; Wk; Wv]` BF16 weight per attention
-/// layer and serve Q/K/V from a single projection dispatch. Ablation on the
-/// paired local benchmark showed a mild prefill cost with no decode gain, so
-/// this ships opt-in.
 let lagunaFusedQKVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV"] == "1"
 
-/// `DARKBLOOM_FUSED_SHARED_GATE_UP` (default on; set "0" to disable): after
-/// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
-/// shared expert and serve single-token decode from one quantized matmul.
-/// Multi-token prefill remains on the stock separate banks so the ranked
-/// prefill path and its smaller gather/GEMM shapes are unchanged.
 let lagunaFusedSharedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_GATE_UP"] != "0"
 
-/// Decode-only shared-expert NVFP4 QMV + SwiGLU fusion. This consumes the
-/// retained row-concatenated `[gate; up]` bank and emits only the 512-wide
-/// BF16 activation, preserving the two independent QMV casts and every BF16
-/// boundary in the compiled SiLU product.
 let lagunaFusedSharedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_SWIGLU_QMV"] != "0"
 
-/// Decode-only shared-expert down QMV plus both sparse-block residual adds.
-/// The kernel preserves the stock BF16 down-projection result, the inner
-/// `routed + shared` rounding, and the outer `h + r2` rounding while avoiding
-/// the intermediate shared/r2 materializations and the final elementwise
-/// dispatch.
 let lagunaFusedSharedDownResidualEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_SHARED_DOWN_RESIDUAL"] != "0"
 
-/// Higher-fusion decode path: the eight routed down projections and the
-/// shared down projection share one 288-thread dispatch, which also performs
-/// the exact router reduction, routed scale, and both BF16 residual adds.
 let lagunaFusedRoutedSharedDownResidualEnabled =
     ProcessInfo.processInfo.environment[
         "DARKBLOOM_FUSED_ROUTED_SHARED_DOWN_RESIDUAL"] != "0"
 
-/// Routed-expert counterpart to the shared QMV + SwiGLU fusion. Each decode
-/// request supplies exactly eight current-token expert indices; the kernel
-/// reads those banks directly and emits `[1, 1, 8, 1, 512]`.
 let lagunaFusedRoutedSwiGLUQMVEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_SWIGLU_QMV"] != "0"
 
-/// `DARKBLOOM_PACKED_SCALES` (default ON; set "0" to disable): decode-only
-/// scale-interleaved side copy of the fused routed gate/up NVFP4 bank. The
-/// stock `lagunaRoutedSwiGLUQMV` reads codes and E4M3 scales from two separate
-/// tensors (four device streams per simdgroup iteration: gate codes, up
-/// codes, gate scales, up scales). The packed side bank stores only the 32
-/// scale bytes for each row and K block, in the kernel's exact walk order
-/// `[expert][tile 128][k-block 4][row-pair sub 8]`; the resident fused code
-/// bank is reused directly. Load widths, dequant expressions, accumulation
-/// order, and every BF16 boundary are identical to the stock kernel — only
-/// scale address computation changes, so the packed dispatch is bit-exact
-/// (class A).
-/// Memory: +~16 MiB resident per sparse layer while enabled (the stock fused
-/// code bank stays resident for prefill and fallback paths).
 let lagunaPackedScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PACKED_SCALES"] != "0"
 
-/// Publish exact corrected router ordinals from the existing fused producer
-/// so routed QMV consumers avoid repeating the nonlinear key construction.
-/// The OFF arm restores the promoted selector dependency exactly.
 private let lagunaRouterPrecomputedKeysEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_ROUTER_PRECOMPUTED_KEYS"] != "0"
 
-/// One-shot stderr visibility for the packed-scales arm: with the flag set,
-/// the arm MUST announce either "active" (bank built / packed dispatch taken)
-/// or "inactive" (a guard declined and the stock kernel ran instead), so a
-/// silently-declining guard can never measure its own control.
 final class LagunaPackedScalesLog: @unchecked Sendable {
     private var seen: Set<String> = []
     private let lock = NSLock()
@@ -192,57 +119,24 @@ final class LagunaPackedScalesLog: @unchecked Sendable {
 
 let lagunaPackedScalesLog = LagunaPackedScalesLog()
 
-/// Decode-only routed NVFP4 down-QMV plus BF16 router weighting, fixed-order
-/// expert reduction, and the Laguna 2.5 routed scale. The custom kernel emits
-/// one 2048-wide branch instead of materializing eight expert rows.
 let lagunaFusedRoutedDownReduceEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_DOWN_REDUCE"] != "0"
 
-/// `DARKBLOOM_FUSED_ROUTED_GATE_UP` (default on; set "0" to disable): after
-/// checkpoint load, retain one row-concatenated NVFP4 `[gate; up]` bank per
-/// sparse layer's routed experts and serve single-token decode's gate/up from
-/// one gather-QMM dispatch. DECODE-ONLY: the module tree, checkpoint keys,
-/// and every multi-token (prefill) forward stay fully stock -- ablation
-/// showed the fused bank helps decode (~+1.9%) but badly hurts the M=512
-/// sorted gather-GEMM prefill path, so prefill always dispatches the stock
-/// separate banks.
-///
-/// That prefill finding pre-dates RUNSKIP. See
-/// `DARKBLOOM_PREFILL_FUSED_GATE_UP` immediately below for the current,
-/// separately-flagged, post-RUNSKIP re-measurement of the same fusion idea
-/// applied to the sorted prefill path -- this flag and its history are left
-/// as-is (decode-only) rather than folded together, so each can be ablated
-/// independently.
 let lagunaFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_ROUTED_GATE_UP"] != "0"
 
-/// Multi-token sorted gather-GEMM counterpart to the decode gate/up fusion;
-/// independently ablatable and row-arithmetic-identical to separate banks.
 let lagunaPrefillFusedRoutedGateUpEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_GATE_UP"] != "0"
 
-/// Exact prefill-only reuse of the certified packed decode scale bank by the
-/// expert-aligned NAX path. Setting the flag to zero keeps the stock fused
-/// scale plane and backend specialization.
 let lagunaPrefillExpertPairwiseScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_PAIRWISE_SCALES"] != "0"
 
-/// Producer-supplied exact expert prefixes for the two fused sorted routed
-/// prefill QMMs. The sorter and consumer identities encode the selected arm;
-/// zero restores the ordinary sorted-key payload exactly.
 let lagunaExpertBoundsSidecarEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_EXPERT_BOUNDS_SIDECAR"] != "0"
 
-// Independent DawgZter N1 persistence receipt; executable behavior is unchanged.
-// Independent fifth-slot continuation; executable behavior remains identical.
-// Official paired-M5 replay nonce 20260807T0236Z; executable source unchanged.
 let lagunaPrefillExpertDownPairwiseScalesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_EXPERT_DOWN_PAIRWISE_SCALES"] != "0"
 
-/// The compact marker is legal only for GatherQMM's sorted RHS expert path,
-/// whose batching guard requires at least four routed rows per expert. Shorter
-/// prefills keep the original full scale plane so no generic kernel can ever
-/// observe the marker representation.
 func lagunaPrefillExpertPairwiseScalesAdmitted(routedRows: Int) -> Bool {
     routedRows >= 4 * LagunaConstants.numExperts
 }
@@ -272,85 +166,31 @@ let lagunaExpertAlignedGatherEnabled = {
     )
 }()
 
-/// Decode post-attention residual + RMSNorm fusion. The kernel emits
-/// both the rounded BF16 residual (needed by the following skip connection)
-/// and the normalized row (consumed immediately by the MLP), eliminating a
-/// separate residual-add materialization/read. Restricted to the single-row
-/// (`x.size == hiddenSize`) decode shape at its call site; see
-/// `lagunaPrefillFusedResidualRMSNormEnabled` immediately below for the
-/// multi-token counterpart, gated independently.
 let lagunaFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_RESIDUAL_RMS"] != "0"
 
-/// Multi-token use of the row-general residual+RMSNorm kernel; its independent
-/// row dispatch preserves the stock add and normalization order per token.
 let lagunaPrefillFusedResidualRMSNormEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_PREFILL_FUSED_RESIDUAL_RMS"] != "0"
 
 
-/// One output row per simdgroup for the default split routed gate/up decode
-/// QMV. Official submission `b56a6d9` passed all 1,344 exact-token checks:
-/// every row retains its K-block order and 32-lane reduction while the grid
-/// exposes twice as many independent simdgroups to cover memory latency.
-/// Set `DARKBLOOM_QMV_R1=0` to restore the two-row control.
 let lagunaSwiGLUQMVRows1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_QMV_R1"] != "0"
 
-/// Shared-expert twin of the accepted routed R1 schedule. The shared branch
-/// is dependency-independent from router top-8 and runs concurrently with it;
-/// one row per SIMD group exposes twice as many weight streams while keeping
-/// each row's four K-block accumulations and reduction tree unchanged.
 let lagunaSharedSwiGLUQMVRows1Enabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_QMV_R1"] != "0"
 
-/// `DARKBLOOM_SHARED_SCALE_HALVED` (default ON; set "0" to ablate): serves
-/// the shared expert's gate/up and `down_proj` NVFP4 scales from the group-32
-/// halved planes instead of the shipped byte-per-16-weights ones. The routed
-/// gate/up and down banks already ship halved (`DARKBLOOM_PACKED_SCALES`);
-/// the shared expert is the last MoE plane still read at full width, worth
-/// 196,608 bytes per sparse layer of which half is a duplicate the quantizer
-/// wrote twice. Nothing is requantized: `lagunaHalvedGroup32ScalePlane`
-/// installs the plane only when every discarded odd byte is bitwise equal to
-/// its even partner, and the pairs that are not are carried in the patch
-/// header, so the kernels reconstruct the shipped plane exactly. Off means
-/// the stock planes and the stock kernels, byte for byte. Measured on-default
-/// after three order-alternated local-submit pairs (decode -0.171% s/token,
-/// on faster in 3/3) plus token-exact correctness with the flag on.
 let lagunaSharedScaleHalvedEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_SHARED_SCALE_HALVED"] != "0"
 
-/// `DARKBLOOM_QMV_WIDE_CODES` (default OFF, under measurement): the shared
-/// gate/up QMV reads code words two adjacent groups at a time. Each lane owns
-/// groups `2l` and `2l+1` of a 1024-weight slab and loads their codes in one
-/// aligned `uint4` instead of two strided `uint2`s, halving both the code
-/// loads and the K-loop trip count; the halved scale plane supplies the pair's
-/// single shared byte, so scale loads halve again. NOT bit-exact against the
-/// stock kernel: the products are identical floats, but each lane now sums a
-/// different pair of groups, so the per-lane partials and the simd tree see a
-/// reassociated order. Requires the halved planes
-/// (`DARKBLOOM_SHARED_SCALE_HALVED`); without them the flag is inert.
 let lagunaSharedQMVWideCodesEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_QMV_WIDE_CODES"] == "1"
 
-/// Folds the per-head softplus gate into the output projection's GEMV (see
-/// `lagunaGatedOutputProjectionSource`), with one kernel variant per attention
-/// family. Set `DARKBLOOM_FUSED_GATED_OUTPUT=0` to ablate.
 let lagunaFusedGatedOutputProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_GATED_OUTPUT"] != "0"
 
-/// Issues Q, K and V as one dispatch over the three stock weights (see
-/// `lagunaFusedQKVProjectionSource`). Unlike `DARKBLOOM_FUSED_QKV` this keeps
-/// no concatenated bank, so prefill is untouched. Set
-/// `DARKBLOOM_FUSED_QKV_PROJECTION=0` to ablate.
 let lagunaFusedQKVProjectionEnabled =
     ProcessInfo.processInfo.environment["DARKBLOOM_FUSED_QKV_PROJECTION"] != "0"
 
-/// TensorFold-derived within-token batching for the serial decode stream.
-/// A native group-32 affine INT8 side layout packs Q/K/V into one batched
-/// quantized matmul, cutting their weight traffic without speculating future
-/// tokens or changing the KV dependency. Prefill stays on the original BF16
-/// projections. Two ranked chunks proved 28 layers; this final bounded chunk
-/// widens the same layout to all 40 layers.
 private let lagunaNativeAffineQKVLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_QKV"] != "0"
     else { return 0 }
@@ -361,22 +201,9 @@ private let lagunaNativeAffineQKVLayerCount: Int = {
 }()
 let lagunaNativeAffineQKVEnabled = lagunaNativeAffineQKVLayerCount > 0
 
-/// Depth-selection mode for both native affine INT8 attention layouts.
-///
-/// **Default (unset or anything but `1`) is the shipped PREFIX predicate**
-/// `layer < count`, so the shipped semantics are byte-for-byte what the ranked
-/// chunks proved. `DARKBLOOM_NATIVE_AFFINE_SUFFIX=1` selects the LAST `count`
-/// layers (`layer >= numHiddenLayers - count`) instead. It exists to measure
-/// whether the quantization perturbation the argmax gate sees depends on the
-/// DEPTH of the quantized site (an early layer's error has 39 more layers of
-/// amplification runway than a late one's) at matched weight-traffic coverage.
 private let lagunaNativeAffineSuffixSelection =
     ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_SUFFIX"] == "1"
 
-/// Restricts a native affine layout to exactly one layer index, for
-/// amplification-vs-depth probes. Unset (or out of range) keeps the normal
-/// prefix/suffix coverage. The layer count must still be non-zero, so the
-/// layout is prepared and dispatched exactly as it would be in a ranked run.
 private func lagunaNativeAffineOnlyLayer(_ key: String) -> Int? {
     guard let raw = ProcessInfo.processInfo.environment[key],
         let value = Int(raw),
@@ -410,20 +237,6 @@ private func lagunaUseNativeAffineQKV(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineQKVOnlyLayer)
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// output projection. `o_proj` is the single largest BF16 decode weight read
-/// left in the attention block — 30 sliding layers at `[2048, 8192]` plus 10
-/// full-attention layers at `[2048, 6144]` is ~1.2 GB of the decode token's
-/// weight traffic — and unlike Q/K/V it is read *after* SDPA, so quantizing it
-/// changes nothing about the KV dependency or the cache contents.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16 parameter,
-/// which stays authoritative and resident. The first 16 layers are the
-/// acceptance-band-safe first chunk; later submissions can widen the same
-/// layout the way `DARKBLOOM_NATIVE_AFFINE_QKV_LAYERS` was widened.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_OPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock gated projection inside the same binary.
 private let lagunaNativeAffineOProjLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_OPROJ"] != "0"
     else { return 0 }
@@ -441,28 +254,6 @@ private func lagunaUseNativeAffineOProj(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineOProjOnlyLayer)
 }
 
-/// The same native group-32 affine INT8 side layout applied to the attention
-/// per-head gate projection (`g_proj`), admitted to the accepted quantization
-/// envelope by the g_proj amendment. `g_proj` is a tiny `[heads, 2048]` BF16
-/// read (48/64 rows), but its decode GEMV is one extra dispatch per layer
-/// against the same normalized row the Q/K/V batch already computes, and its
-/// output feeds only the softplus gate — never the KV cache — so requantizing
-/// it perturbs the model strictly less than the already-shipped Q/K/V and
-/// o_proj layouts. Unlike those layouts the gate bank is ALWAYS group-32
-/// affine INT8: the envelope caps `g_proj` there, so the NVFP4 tail window
-/// (`lagunaNativeAffineNVFP4From`) and the measurement-only probe format do
-/// not apply to it. On layers whose QKV bank is itself group-32 INT8 the gate
-/// rows concatenate into that same bank and ride the same dispatch for free;
-/// on the NVFP4 tail layers the gate keeps a separate group-32 INT8 bank and
-/// replaces the BF16 GEMV one dispatch for one dispatch.
-///
-/// Decode only: prefill and every non-`[1, 1, ·]` call keep the BF16
-/// parameter, which stays authoritative and resident. Coverage is prepared
-/// inside `prepareNativeAffineQKVWeight`, so a layer only gets the gate
-/// layout when its QKV layout is also active.
-///
-/// Set `DARKBLOOM_NATIVE_AFFINE_GPROJ=0` (or `..._LAYERS=0`) to fall back to
-/// the exact stock BF16 gate projection inside the same binary.
 private let lagunaNativeAffineGProjLayerCount: Int = {
     guard ProcessInfo.processInfo.environment["DARKBLOOM_NATIVE_AFFINE_GPROJ"] != "0"
     else { return 0 }
@@ -483,10 +274,6 @@ private func lagunaUseNativeAffineGProj(layer: Int) -> Bool {
         onlyLayer: lagunaNativeAffineGProjOnlyLayer)
 }
 
-/// Builds the gate projection's side layout. Unlike
-/// `lagunaNativeAffineWeight` this NEVER takes the NVFP4 tail window or the
-/// probe round-trip: the accepted envelope admits `g_proj` only as group-32
-/// affine INT8, so the layout is fixed regardless of layer depth.
 private func lagunaNativeAffineGProjWeight(_ weight: MLXArray) -> LagunaNativeAffineWeight? {
     guard weight.dtype == .bfloat16, weight.ndim == 2,
         weight.dim(1).isMultiple(of: 32)
