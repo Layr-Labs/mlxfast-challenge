@@ -317,6 +317,100 @@ private let routeFusedScatterKernel: MLXFast.MLXFastKernel = {
     )
 }()
 
+/// N3 candidate: preserve the fused sorter's existing global-prefix work, but
+/// scatter by input row instead of assigning one lane to each expert. Once all
+/// 256 expert lanes have published their exact base for this tile, the first
+/// 128 lanes compute the stable rank of their own row among prior equal keys.
+/// This removes the control's 256 x 128 tile walk without atomically claiming
+/// output positions: every row derives its one exact stable destination.
+///
+/// Default on for the exact 4,096-route production shape; set the selector to
+/// zero to restore the current fused sorter. This stays independent of N1.
+private let routeRowCentricScatterEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTE_ROW_CENTRIC_SCATTER"] != "0"
+
+private let routeRowCentricScatterKernel: MLXFast.MLXFastKernel = {
+    let m = routeFusedScatterTopK
+    return MLXFast.metalKernel(
+        name: "mlx_lm_route_csort_scatter_row_centric_m\(m)_u32_v1",
+        inputNames: ["keys"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            constexpr uint TILE = \(routeSortTile);
+            constexpr uint M = \(m);
+            uint t = threadgroup_position_in_grid.x;
+            uint k = thread_position_in_threadgroup.x;
+            uint simd_id = k / 32;
+            uint lane = k % 32;
+            uint n = keys_shape[0];
+            // Identical prefix/global-base work to the control kernel.
+            threadgroup atomic_uint tg_total[256];
+            threadgroup atomic_uint tg_before[256];
+            atomic_store_explicit(&tg_total[k], 0u, memory_order_relaxed);
+            atomic_store_explicit(&tg_before[k], 0u, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint before_limit = t * TILE;
+            uint idx = k;
+            for (; idx < before_limit; idx += 256) {
+                uint key = keys[idx];
+                atomic_fetch_add_explicit(
+                    &tg_total[key], 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &tg_before[key], 1u, memory_order_relaxed);
+            }
+            for (; idx < n; idx += 256) {
+                atomic_fetch_add_explicit(
+                    &tg_total[keys[idx]], 1u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint total = atomic_load_explicit(&tg_total[k], memory_order_relaxed);
+            uint lane_excl = simd_prefix_exclusive_sum(total);
+            threadgroup uint simd_totals[8];
+            if (lane == 31) {
+                simd_totals[simd_id] = lane_excl + total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint simd_base = 0;
+            for (uint s = 0; s < simd_id; ++s) {
+                simd_base += simd_totals[s];
+            }
+
+            // Reuse tg_total after its last read to publish one exact base per
+            // expert for this tile. Stores/loads are atomic only because the
+            // reusable allocation has atomic element type; there is no atomic
+            // read-modify-write in the row-centric scatter.
+            threadgroup uint tile_keys[TILE];
+            if (k < TILE) {
+                tile_keys[k] = keys[t * TILE + k];
+            }
+            uint tile_base = simd_base + lane_excl +
+                atomic_load_explicit(&tg_before[k], memory_order_relaxed);
+            atomic_store_explicit(
+                &tg_total[k], tile_base, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // One lane per row. Prior-equal rank is deterministic and gives
+            // the exact same stable position as the control's input-order walk.
+            if (k < TILE) {
+                uint row_idx = t * TILE + k;
+                uint key = tile_keys[k];
+                uint prior_equal = 0;
+                for (uint i = 0; i < k; ++i) {
+                    if (tile_keys[i] == key) {
+                        ++prior_equal;
+                    }
+                }
+                uint off = atomic_load_explicit(
+                    &tg_total[key], memory_order_relaxed) + prior_equal;
+                row_order[off] = row_idx / M;
+                sorted_keys[off] = key;
+                inverse_order[row_idx] = off;
+            }
+            """,
+        ensureRowContiguous: false
+    )
+}()
+
 private func routeCountingSortFused(
     _ indices: MLXArray, m: Int
 ) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
@@ -327,7 +421,9 @@ private func routeCountingSortFused(
         m == routeFusedScatterTopK
     else { return nil }
     let tiles = n / routeSortTile
-    let outputs = routeFusedScatterKernel(
+    let kernel = routeRowCentricScatterEnabled && n == 4096
+        ? routeRowCentricScatterKernel : routeFusedScatterKernel
+    let outputs = kernel(
         [indices],
         grid: (tiles * 256, 1, 1),
         threadGroup: (256, 1, 1),
