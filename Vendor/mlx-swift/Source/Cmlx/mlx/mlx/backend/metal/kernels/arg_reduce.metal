@@ -81,7 +81,6 @@ METAL_FUNC IndexValPair<T> arg_reduce_generic(
   Op op;
   IndexValPair<T> best{0, Op::init};
 
-  // Loop over the reduction axis in lsize*N_READS buckets.
   for (uint r = 0; r < ceildiv(axis_size, N_READS * lsize.x); r++) {
     uint32_t current_index = r * lsize.x * N_READS + lid.x * N_READS;
     uint32_t offset = current_index;
@@ -108,9 +107,6 @@ METAL_FUNC IndexValPair<bfloat16_t> argmax_bfloat16_100352(
   Op op;
   IndexValPair<bfloat16_t> best{0, Op::init};
 
-  // The fixed vocabulary is 24 complete 4,096-element waves followed by one
-  // 2,048-element half wave. Preserve the generic loop's per-lane read order,
-  // but remove its 100,352 dynamic bounds checks.
   for (uint32_t r = 0; r < full_waves; r++) {
     uint32_t offset = r * wave_size + lid * reads;
     const device bfloat16_t* current_in = in + in_idx + offset;
@@ -145,24 +141,8 @@ template <typename T, typename Op, int N_READS = 4>
     uint simd_size [[threads_per_simdgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
-  // Shapes and strides *do not* contain the reduction axis. The reduction size
-  // and stride are provided in axis_stride and axis_size.
-  //
-  // Note: in shape == out shape with this convention.
-  //
-  // The sketch of the kernel is as follows.
-  //    1. Launch prod(shape) * thread_group_size threads.
-  //    2. Loop ceildiv(axis_size / lsize) times
-  //    3. Read input values
-  //    4. Reduce among them and go to 3
-  //    4. Reduce in each simd_group
-  //    6. Write in the thread local memory
-  //    6. Reduce them across thread group
-  //    7. Write the output without need for atomic
   Op op;
 
-  // Compute the input/output index. There is one beginning and one output for
-  // the whole threadgroup.
   int64_t row_idx = gid.y + static_cast<int64_t>(gsize.y) * gid.z;
   auto in_idx = elem_to_loc(row_idx, shape, in_strides, ndim);
   auto out_idx = elem_to_loc(row_idx, shape, out_strides, ndim);
@@ -183,16 +163,12 @@ template <typename T, typename Op, int N_READS = 4>
   }
 
   threadgroup IndexValPair<T> local_data[32];
-  // At this point we have reduced the axis into thread group best values so we
-  // need to reduce across the thread group.
 
-  // First per simd reduction.
   for (uint offset = simd_size / 2; offset > 0; offset /= 2) {
     IndexValPair<T> neighbor = simd_shuffle_down(best, offset);
     best = op.reduce(best, neighbor);
   }
 
-  // Write to the threadgroup memory
   if (simd_lane_id == 0) {
     local_data[simd_group_id] = best;
   }
@@ -201,7 +177,6 @@ template <typename T, typename Op, int N_READS = 4>
     return;
   }
 
-  // Read the appropriate value from local data and perform one simd reduction
   uint simd_groups = ceildiv(lsize.x, simd_size);
   if (simd_lane_id < simd_groups) {
     best = local_data[simd_lane_id];
@@ -211,7 +186,6 @@ template <typename T, typename Op, int N_READS = 4>
     best = op.reduce(best, neighbor);
   }
 
-  // Finally write the output
   if (lid.x == 0) {
     out[out_idx] = best.index;
   }
