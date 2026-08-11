@@ -349,6 +349,106 @@ private let routeFusedScatterKernel = makeRouteFusedScatterKernel(
 private let routeFusedScatterExpertBoundsKernel = makeRouteFusedScatterKernel(
     expertBoundsSidecar: true)
 
+private let routeRowCentricScatterEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_ROUTE_ROW_CENTRIC_SCATTER"] != "0"
+
+private func makeRouteRowCentricScatterKernel(
+    expertBoundsSidecar: Bool
+) -> MLXFast.MLXFastKernel {
+    let m = routeFusedScatterTopK
+    let expertBoundsValue = expertBoundsSidecar ? "true" : "false"
+    let expertBoundsSuffix = expertBoundsSidecar ? "_eb_1" : ""
+    return MLXFast.metalKernel(
+        name: "mlx_lm_route_csort_scatter_row_centric_m\(m)_u32_v1\(expertBoundsSuffix)",
+        inputNames: ["keys"],
+        outputNames: ["row_order", "sorted_keys", "inverse_order"],
+        source: """
+            constexpr uint TILE = \(routeSortTile);
+            constexpr uint M = \(m);
+            constexpr bool EXPERT_BOUNDS_SIDECAR = \(expertBoundsValue);
+            constexpr uint EXPERT_BOUNDS_MARKER_WORDS = 16;
+            constexpr uint SORTED_KEYS_OFFSET =
+                EXPERT_BOUNDS_SIDECAR ? EXPERT_BOUNDS_MARKER_WORDS : 0;
+            uint t = threadgroup_position_in_grid.x;
+            uint k = thread_position_in_threadgroup.x;
+            uint simd_id = k / 32;
+            uint lane = k % 32;
+            uint n = keys_shape[0];
+            threadgroup atomic_uint tg_total[256];
+            threadgroup atomic_uint tg_before[256];
+            atomic_store_explicit(&tg_total[k], 0u, memory_order_relaxed);
+            atomic_store_explicit(&tg_before[k], 0u, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint before_limit = t * TILE;
+            uint idx = k;
+            for (; idx < before_limit; idx += 256) {
+                uint key = keys[idx];
+                atomic_fetch_add_explicit(
+                    &tg_total[key], 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &tg_before[key], 1u, memory_order_relaxed);
+            }
+            for (; idx < n; idx += 256) {
+                atomic_fetch_add_explicit(
+                    &tg_total[keys[idx]], 1u, memory_order_relaxed);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint total = atomic_load_explicit(&tg_total[k], memory_order_relaxed);
+            uint lane_excl = simd_prefix_exclusive_sum(total);
+            threadgroup uint simd_totals[8];
+            if (lane == 31) {
+                simd_totals[simd_id] = lane_excl + total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint simd_base = 0;
+            for (uint s = 0; s < simd_id; ++s) {
+                simd_base += simd_totals[s];
+            }
+            uint global_base = simd_base + lane_excl;
+            if (EXPERT_BOUNDS_SIDECAR && t == 0) {
+                sorted_keys[SORTED_KEYS_OFFSET + k] = global_base;
+                if (k == 255) {
+                    sorted_keys[SORTED_KEYS_OFFSET + 256] = n;
+                }
+            }
+
+            threadgroup uint tile_keys[TILE];
+            if (k < TILE) {
+                tile_keys[k] = keys[t * TILE + k];
+            }
+            uint tile_base = global_base +
+                atomic_load_explicit(&tg_before[k], memory_order_relaxed);
+            atomic_store_explicit(
+                &tg_total[k], tile_base, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (k < TILE) {
+                uint row_idx = t * TILE + k;
+                uint key = tile_keys[k];
+                uint prior_equal = 0;
+                for (uint i = 0; i < k; ++i) {
+                    if (tile_keys[i] == key) {
+                        ++prior_equal;
+                    }
+                }
+                uint off = atomic_load_explicit(
+                    &tg_total[key], memory_order_relaxed) + prior_equal;
+                row_order[off] = row_idx / M;
+                if (!EXPERT_BOUNDS_SIDECAR || off > 256) {
+                    sorted_keys[SORTED_KEYS_OFFSET + off] = key;
+                }
+                inverse_order[row_idx] = off;
+            }
+            """,
+        ensureRowContiguous: false
+    )
+}
+
+private let routeRowCentricScatterKernel = makeRouteRowCentricScatterKernel(
+    expertBoundsSidecar: false)
+private let routeRowCentricScatterExpertBoundsKernel = makeRouteRowCentricScatterKernel(
+    expertBoundsSidecar: true)
+
 private func routeCountingSortFused(
     _ indices: MLXArray, m: Int, expertBoundsSidecar: Bool
 ) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
@@ -361,9 +461,17 @@ private func routeCountingSortFused(
     else { return nil }
     let tiles = n / routeSortTile
     let sortedKeysMarkerWords = expertBoundsSidecar ? 16 : 0
-    let kernel = expertBoundsSidecar
-        ? routeFusedScatterExpertBoundsKernel
-        : routeFusedScatterKernel
+    let useRowCentric = routeRowCentricScatterEnabled && n == 4096
+    let kernel: MLXFast.MLXFastKernel
+    if useRowCentric {
+        kernel = expertBoundsSidecar
+            ? routeRowCentricScatterExpertBoundsKernel
+            : routeRowCentricScatterKernel
+    } else {
+        kernel = expertBoundsSidecar
+            ? routeFusedScatterExpertBoundsKernel
+            : routeFusedScatterKernel
+    }
     let outputs = kernel(
         [indices],
         grid: (tiles * 256, 1, 1),

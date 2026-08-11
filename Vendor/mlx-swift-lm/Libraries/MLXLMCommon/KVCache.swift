@@ -416,6 +416,15 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     /// is then an identity-value op.
     private var fusedAppendContiguized = false
 
+    /// Read-only twin of `fusedAppendPrepare`; never contiguizes or mutates.
+    public func fusedAppendDescriptor() -> (writeIdx: Int, count: Int, capacity: Int)? {
+        guard let currentKeys = keys, let currentValues = values,
+            offset + 1 <= currentKeys.dim(2),
+            currentValues.dim(2) == currentKeys.dim(2)
+        else { return nil }
+        return (offset, offset + 1, currentKeys.dim(2))
+    }
+
     /// Append state for the fused decode attention kernel, or nil when the
     /// backing has no spare row (growth would be required — the stock path
     /// handles that step). `writeIdx` is the slot the stock single-token
@@ -699,6 +708,20 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     /// each step and the slot writes would be lost); the prompt-retained
     /// values array in particular is a transposed view after prefill.
     private var fusedRingContiguized = false
+
+    /// Read-only twin of `fusedRingPrepare`; never contiguizes or mutates.
+    public func fusedRingDescriptor() -> (writeIdx: Int, count: Int, capacity: Int)? {
+        guard keep == 0, let currentKeys = keys, let currentValues = values,
+            currentKeys.dim(2) == maxCacheSize,
+            currentValues.dim(2) == maxCacheSize,
+            offset >= maxCacheSize
+        else { return nil }
+        return (
+            idx == maxCacheSize ? keep : idx,
+            maxCacheSize,
+            maxCacheSize
+        )
+    }
 
     /// Steady-ring state for the fused decode attention kernel, or nil
     /// when the ring is not yet at capacity (shorter prompts, growth
