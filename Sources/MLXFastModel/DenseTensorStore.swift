@@ -1,3 +1,10 @@
+// receipt-nonce: maple-advisor-r113-01
+// Comment-only nonce so the submission archive hashes differently from the
+// preceding maple HEAD-class receipts (c1c0ba2, 2771067, 8858427). Zero
+// declarations, zero code paths, zero effect on emitted tokens or timing.
+// Purpose: one more draw of the SAME executable class, to (a) buy a lottery
+// ticket against the static crown and (b) tighten the class-mean estimate,
+// which R113 shows is now the dominant uncertainty in the campaign plan.
 import Darwin
 import Foundation
 import MLXFastCore
