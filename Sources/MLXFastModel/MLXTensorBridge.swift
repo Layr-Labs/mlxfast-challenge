@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXFastCore
 
+// Octonary variance-control redraw: executable source remains the promoted 4ea N1 frontier.
 public protocol MLXTensorBridge {
     associatedtype Array
 
