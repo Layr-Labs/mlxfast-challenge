@@ -991,3 +991,349 @@ final class LagunaLmHeadPruner {
 // Official measurement receipt 2 of 3 for the M1 cascade family. The archive
 // service de-duplicates byte-identical trees, so each receipt in a family
 // carries one distinct comment. No code differs between the three.
+
+import Foundation
+import MLX
+import MLXFast
+
+/// Decode-only exact-search index over the authoritative BF16 LM head.
+/// Set `DARKBLOOM_LM_HEAD_TREE=0` to restore the current certified flat cascade.
+let lagunaLmHeadTreeEnabled =
+    ProcessInfo.processInfo.environment["DARKBLOOM_LM_HEAD_TREE"] != "0"
+
+private let lagunaLmHeadTreeLeafSize = 64
+private let lagunaLmHeadTreeProjectionCount = 16
+
+private let lagunaLmHeadExactDotHeader = """
+    static inline float laguna_lmhead_exact_dot(
+        const device bfloat* row,
+        const device bfloat* x,
+        uint lane
+    ) {
+        float result = 0.0f;
+        thread bfloat inter[4];
+        thread float v_coeff[4];
+        uint bn = lane * 4;
+        for (uint i = 0; i < 16; ++i) {
+            vec<bfloat, 4> xv =
+                *((const device vec<bfloat, 4>*)(x + bn));
+            v_coeff[0] = float(xv.x);
+            v_coeff[1] = float(xv.y);
+            v_coeff[2] = float(xv.z);
+            v_coeff[3] = float(xv.w);
+            vec<bfloat, 4> mv =
+                *((const device vec<bfloat, 4>*)(row + bn));
+            inter[0] = mv.x;
+            inter[1] = mv.y;
+            inter[2] = mv.z;
+            inter[3] = mv.w;
+            result += inter[0] * v_coeff[0];
+            result += inter[1] * v_coeff[1];
+            result += inter[2] * v_coeff[2];
+            result += inter[3] * v_coeff[3];
+            bn += 128;
+        }
+        #pragma unroll
+        for (ushort sn = 16; sn >= 1; sn >>= 1) {
+            result += simd_shuffle_down(result, sn);
+        }
+        return result;
+    }
+
+    static inline float laguna_float_next_up(float value) {
+        if (isnan(value) || value == metal::numeric_limits<float>::infinity()) {
+            return value;
+        }
+        if (value == 0.0f) {
+            return as_type<float>(1u);
+        }
+        uint bits = as_type<uint>(value);
+        bits += value > 0.0f ? 1u : uint(-1);
+        return as_type<float>(bits);
+    }
+    """
+
+/// One threadgroup per 64-row leaf. Per-coordinate BF16 minima/maxima are
+/// authoritative intervals: every product is exact in FP32, and the positive
+/// `4*gamma*absSum` term covers both the bound reduction and the stock GEMV's
+/// accepted FP32 accumulation error. The final one-ULP bump is directed up.
+private let lagunaLmHeadLeafBoundsKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_tree_leaf_box_bounds_v1",
+    inputNames: ["x", "leaf_lo", "leaf_hi"],
+    outputNames: ["bounds"],
+    source: """
+        constexpr uint K = 2048;
+        constexpr float GAMMA = 0x1p-15f;
+        uint leaf = threadgroup_position_in_grid.x;
+        uint tid = thread_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint sgid = simdgroup_index_in_threadgroup;
+        threadgroup float shared_sum[8];
+        threadgroup float shared_abs[8];
+
+        const device bfloat* lo = leaf_lo + size_t(leaf) * K;
+        const device bfloat* hi = leaf_hi + size_t(leaf) * K;
+        float sum = 0.0f;
+        float abs_sum = 0.0f;
+        for (uint j = tid; j < K; j += 256) {
+            float xv = float(x[j]);
+            float a = xv * float(lo[j]);
+            float b = xv * float(hi[j]);
+            sum += metal::max(a, b);
+            abs_sum += metal::max(metal::abs(a), metal::abs(b));
+        }
+        sum = simd_sum(sum);
+        abs_sum = simd_sum(abs_sum);
+        if (lane == 0) {
+            shared_sum[sgid] = sum;
+            shared_abs[sgid] = abs_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgid == 0) {
+            float v = lane < 8 ? shared_sum[lane] : 0.0f;
+            float av = lane < 8 ? shared_abs[lane] : 0.0f;
+            v = simd_sum(v);
+            av = simd_sum(av);
+            if (lane == 0) {
+                float upper = v + (4.0f * GAMMA) * av;
+                bounds[leaf] = laguna_float_next_up(upper);
+            }
+        }
+        """,
+    header: lagunaLmHeadExactDotHeader,
+    ensureRowContiguous: true
+)
+
+/// Chooses the leaf with the largest admissible bound, evaluates all 64 of
+/// its authoritative rows with the stock GEMV order, and emits the midpoint
+/// below its exact BF16 incumbent. Any exact incumbent is sufficient for a
+/// sound threshold; the maximum-bound leaf is a performance choice only.
+private let lagunaLmHeadSeedThresholdKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_tree_seed_leaf_threshold_v1",
+    inputNames: ["bounds", "row_order", "lm_head", "x"],
+    outputNames: ["threshold"],
+    source: """
+        constexpr uint K = 2048;
+        constexpr uint LEAVES = 1568;
+        constexpr uint LEAF = 64;
+        uint tid = thread_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint sgid = simdgroup_index_in_threadgroup;
+        threadgroup uint chosen_leaf[1];
+        threadgroup float exact_values[LEAF];
+        threadgroup uint exact_indices[LEAF];
+
+        if (tid == 0) {
+            float best = -metal::numeric_limits<float>::infinity();
+            uint best_leaf = 0;
+            for (uint leaf = 0; leaf < LEAVES; ++leaf) {
+                float value = bounds[leaf];
+                if (value > best) {
+                    best = value;
+                    best_leaf = leaf;
+                }
+            }
+            chosen_leaf[0] = best_leaf;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint leaf = chosen_leaf[0];
+        for (uint round = 0; round < 8; ++round) {
+            uint slot = sgid + 8 * round;
+            uint row_index = row_order[leaf * LEAF + slot];
+            const device bfloat* row = lm_head + size_t(row_index) * K;
+            float value = laguna_lmhead_exact_dot(row, x, lane);
+            if (lane == 0) {
+                exact_values[slot] = float(bfloat(value));
+                exact_indices[slot] = row_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            float best = -metal::numeric_limits<float>::infinity();
+            uint best_idx = 0xFFFFFFFFu;
+            for (uint slot = 0; slot < LEAF; ++slot) {
+                float value = exact_values[slot];
+                uint row_index = exact_indices[slot];
+                if (value > best || (value == best && row_index < best_idx)) {
+                    best = value;
+                    best_idx = row_index;
+                }
+            }
+            if (!isfinite(best)) {
+                threshold[0] = -metal::numeric_limits<float>::infinity();
+                return;
+            }
+            uint bits = as_type<uint>(best) >> 16;
+            uint magnitude = bits & 0x7FFFu;
+            uint predecessor_bits;
+            if (magnitude == 0u) {
+                predecessor_bits = 0x8001u;
+            } else if ((bits & 0x8000u) == 0u) {
+                predecessor_bits = bits - 1u;
+            } else {
+                predecessor_bits = bits + 1u;
+            }
+            float predecessor = as_type<float>(predecessor_bits << 16);
+            float rounded_value = as_type<float>(bits << 16);
+            threshold[0] = predecessor + (rounded_value - predecessor) * 0.5f;
+        }
+        """,
+    header: lagunaLmHeadExactDotHeader,
+    ensureRowContiguous: true
+)
+
+/// One threadgroup per leaf. A leaf whose upper bound is strictly below the
+/// incumbent midpoint writes a finite certified-below fill at original row
+/// indices. Every other leaf evaluates all 64 authoritative rows exactly.
+private let lagunaLmHeadLeafExactKernel = MLXFast.metalKernel(
+    name: "laguna_lmhead_tree_leaf_exact_or_fill_v1",
+    inputNames: ["bounds", "threshold", "row_order", "lm_head", "x"],
+    outputNames: ["logits"],
+    source: """
+        constexpr uint K = 2048;
+        constexpr uint LEAF = 64;
+        uint leaf = threadgroup_position_in_grid.x;
+        uint tid = thread_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint sgid = simdgroup_index_in_threadgroup;
+        float upper = bounds[leaf];
+
+        if (upper < threshold[0]) {
+            if (tid < LEAF) {
+                uint row_index = row_order[leaf * LEAF + tid];
+                logits[row_index] = bfloat(upper);
+            }
+            return;
+        }
+
+        for (uint round = 0; round < 8; ++round) {
+            uint slot = sgid + 8 * round;
+            uint row_index = row_order[leaf * LEAF + slot];
+            const device bfloat* row = lm_head + size_t(row_index) * K;
+            float value = laguna_lmhead_exact_dot(row, x, lane);
+            if (lane == 0) {
+                logits[row_index] = bfloat(value);
+            }
+        }
+        """,
+    header: lagunaLmHeadExactDotHeader,
+    ensureRowContiguous: true
+)
+
+final class LagunaLmHeadTree {
+    let leafLo: MLXArray
+    let leafHi: MLXArray
+    let rowOrder: MLXArray
+
+    var residentArrays: [MLXArray] { [leafLo, leafHi, rowOrder] }
+
+    init?(lmHeadWeight: MLXArray) {
+        let vocab = LagunaConstants.vocabSize
+        let hidden = LagunaConstants.hiddenSize
+        let leafSize = lagunaLmHeadTreeLeafSize
+        guard lmHeadWeight.shape == [vocab, hidden],
+            lmHeadWeight.dtype == .bfloat16,
+            vocab.isMultiple(of: leafSize)
+        else { return nil }
+
+        let projectionCount = lagunaLmHeadTreeProjectionCount
+        let scale = 1.0 / sqrt(Float(hidden))
+        var projectionValues: [Float] = []
+        projectionValues.reserveCapacity(hidden * projectionCount)
+        var state = UInt64(0x4c4d_4845_4144_5452)
+        for _ in 0..<(hidden * projectionCount) {
+            state ^= state << 13
+            state ^= state >> 7
+            state ^= state << 17
+            projectionValues.append((state & 1) == 0 ? -scale : scale)
+        }
+        let projection = MLXArray(projectionValues, [hidden, projectionCount])
+        let sketch = matmul(lmHeadWeight.asType(.float32), projection)
+        let sketchValues = sketch.asArray(Float.self)
+
+        var thresholds = Array(repeating: (Float.zero, Float.zero, Float.zero), count: projectionCount)
+        for dimension in 0..<projectionCount {
+            var values: [Float] = []
+            values.reserveCapacity(vocab)
+            for row in 0..<vocab {
+                values.append(sketchValues[row * projectionCount + dimension])
+            }
+            values.sort()
+            thresholds[dimension] = (
+                values[vocab / 4], values[vocab / 2], values[(3 * vocab) / 4])
+        }
+
+        var keyedRows: [(UInt32, UInt32)] = []
+        keyedRows.reserveCapacity(vocab)
+        for row in 0..<vocab {
+            var key: UInt32 = 0
+            for dimension in 0..<projectionCount {
+                let value = sketchValues[row * projectionCount + dimension]
+                let q: UInt32
+                let t = thresholds[dimension]
+                if value < t.0 { q = 0 }
+                else if value < t.1 { q = 1 }
+                else if value < t.2 { q = 2 }
+                else { q = 3 }
+                key |= (q & 1) << UInt32(dimension)
+                key |= ((q >> 1) & 1) << UInt32(projectionCount + dimension)
+            }
+            keyedRows.append((key, UInt32(row)))
+        }
+        keyedRows.sort {
+            $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 < $1.0
+        }
+        let order = keyedRows.map(\.1)
+        guard order.count == vocab, Set(order).count == vocab else { return nil }
+
+        let leafCount = vocab / leafSize
+        let orderArray = MLXArray(order, [leafCount, leafSize])
+        let reordered = contiguous(take(lmHeadWeight, orderArray.reshaped([vocab]), axis: 0))
+            .reshaped([leafCount, leafSize, hidden])
+        let lo = reordered.min(axis: 1)
+        let hi = reordered.max(axis: 1)
+        eval(lo, hi, orderArray)
+        guard lo.shape == [leafCount, hidden], hi.shape == [leafCount, hidden],
+            lo.dtype == .bfloat16, hi.dtype == .bfloat16
+        else { return nil }
+
+        self.leafLo = lo
+        self.leafHi = hi
+        self.rowOrder = orderArray
+    }
+
+    func logits(hidden: MLXArray, lmHeadWeight: MLXArray) -> MLXArray {
+        let vocab = LagunaConstants.vocabSize
+        let leafCount = vocab / lagunaLmHeadTreeLeafSize
+        precondition(
+            hidden.dtype == .bfloat16 && hidden.size == LagunaConstants.hiddenSize
+                && lmHeadWeight.dtype == .bfloat16
+                && lmHeadWeight.shape == [vocab, LagunaConstants.hiddenSize]
+        )
+        let x = hidden.reshaped([LagunaConstants.hiddenSize])
+        let bounds = lagunaLmHeadLeafBoundsKernel(
+            [x, leafLo, leafHi],
+            grid: (leafCount * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[leafCount]],
+            outputDTypes: [.float32]
+        )[0]
+        let threshold = lagunaLmHeadSeedThresholdKernel(
+            [bounds, rowOrder, lmHeadWeight, x],
+            grid: (256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[1]],
+            outputDTypes: [.float32]
+        )[0]
+        let result = lagunaLmHeadLeafExactKernel(
+            [bounds, threshold, rowOrder, lmHeadWeight, x],
+            grid: (leafCount * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[vocab]],
+            outputDTypes: [.bfloat16]
+        )[0]
+        return result.reshaped([1, 1, vocab])
+    }
+}

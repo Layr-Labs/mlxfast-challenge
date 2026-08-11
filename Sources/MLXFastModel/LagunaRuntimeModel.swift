@@ -11595,6 +11595,10 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
     /// cleanly; the stock full pass is used otherwise.
     private var lmHeadPruner: LagunaLmHeadPruner?
 
+    /// Certified clustered interval index for one-token decode. The current
+    /// flat cascade remains the exact fallback and the prefill path.
+    private var lmHeadTree: LagunaLmHeadTree?
+
     public init(_ config: LagunaConfig) {
         self.configuration = config
         self._model.wrappedValue = LagunaRuntimeModelInner(config)
@@ -11634,7 +11638,9 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
 
         let result: MLXArray
         if let lmHead {
-            if let pruner = lmHeadPruner,
+            if inputs.dims(1, 1), let tree = lmHeadTree {
+                result = tree.logits(hidden: hidden, lmHeadWeight: lmHead.weight)
+            } else if let pruner = lmHeadPruner,
                 inputs.dims(1, 1) || lagunaLmHeadPrunePrefillEnabled
             {
                 // Certified two-pass final-row head (notes/68): full BF16
@@ -11730,6 +11736,14 @@ public final class LagunaRuntimeModel: Module, LanguageModel {
                 eval(pruner.residentArrays)
                 FileHandle.standardError.write(
                     Data("mlxfast: lm_head prune active (coarse copy resident)\n".utf8))
+            }
+        }
+        if lagunaLmHeadTreeEnabled, let lmHead {
+            lmHeadTree = LagunaLmHeadTree(lmHeadWeight: lmHead.weight)
+            if let tree = lmHeadTree {
+                eval(tree.residentArrays)
+                FileHandle.standardError.write(
+                    Data("mlxfast: lm_head certified tree active\n".utf8))
             }
         }
     }
